@@ -6,6 +6,8 @@ import { supabase } from "./lib/supabase";
 import boutiqueImage from "./assets/stockwise-boutique.png";
 import "./App.StockWise.Grouped.css";
 import "./App.StockWise.Stock.css";
+import "./App.StockWise.Sales.css";
+import "./App.StockWise.PhoneScan.css";
 
 function BarcodeGraphic({ value }: { value: string }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -37,6 +39,127 @@ type Shop = {
   timezone: string;
 };
 
+
+/** Connexion temporaire du téléphone au module actif du PC. */
+function PhoneScanConnector({ shop, onBarcode, title }: { shop: Shop | null; onBarcode: (barcode: string) => Promise<void>; title: string }) {
+  const [pairingCode, setPairingCode] = useState("");
+  const [expiresAt, setExpiresAt] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [connectorError, setConnectorError] = useState("");
+  const [connected, setConnected] = useState(false);
+  const handled = useRef<Set<string>>(new Set());
+  const onBarcodeRef = useRef(onBarcode);
+  onBarcodeRef.current = onBarcode;
+
+  async function startSession() {
+    if (!shop || busy) return;
+    setBusy(true); setConnectorError(""); handled.current.clear();
+    try {
+      const { data, error } = await supabase.rpc("create_phone_scan_session", { p_shop_id: shop.id });
+      if (error) throw new Error(error.message);
+      const row = Array.isArray(data) ? data[0] : data;
+      if (!row?.pairing_code) throw new Error("Supabase n’a pas retourné de code de connexion.");
+      setPairingCode(String(row.pairing_code)); setExpiresAt(String(row.expires_at ?? "")); setConnected(true);
+    } catch (e) { setConnectorError(e instanceof Error ? e.message : "Impossible de connecter le téléphone."); }
+    finally { setBusy(false); }
+  }
+
+  async function closeSession() {
+    if (shop && pairingCode) {
+      try { await supabase.rpc("close_phone_scan_session", { p_shop_id: shop.id, p_pairing_code: pairingCode }); } catch { /* expiration serveur de secours */ }
+    }
+    setConnected(false); setPairingCode(""); setExpiresAt("");
+  }
+
+  useEffect(() => {
+    if (!connected || !shop || !pairingCode) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const { data, error } = await supabase.rpc("read_phone_scans", { p_shop_id: shop.id, p_pairing_code: pairingCode });
+        if (error) throw new Error(error.message);
+        for (const event of (data ?? []) as Array<{ event_id: string; barcode: string }>) {
+          if (cancelled || handled.current.has(event.event_id)) continue;
+          handled.current.add(event.event_id);
+          try {
+            await onBarcodeRef.current(event.barcode);
+            if (!cancelled) await supabase.rpc("ack_phone_scan", { p_shop_id: shop.id, p_pairing_code: pairingCode, p_event_id: event.event_id });
+          } catch (e) {
+            handled.current.delete(event.event_id);
+            if (!cancelled) setConnectorError(e instanceof Error ? e.message : "Impossible de traiter ce code-barres.");
+          }
+        }
+      } catch (e) {
+        if (!cancelled) setConnectorError(e instanceof Error ? e.message : "La session mobile a expiré.");
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => { void poll(); }, 1800);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [connected, shop?.id, pairingCode]);
+
+  return <section className="product-form-card phone-scan-connector">
+    <div className="product-form-heading"><div><h2><Icon name="smartphone" size={19} /> Scanner avec un téléphone</h2><p>{title} · Les scans arrivent dans ce module et ne modifient pas le stock à eux seuls.</p></div></div>
+    {!connected ? <button className="secondary-button" type="button" onClick={() => void startSession()} disabled={!shop || busy}><Icon name="smartphone" size={16} /> {busy ? "Préparation…" : "Connecter un téléphone"}</button> : <>
+      <div className="phone-scan-code"><span>Code temporaire</span><strong>{pairingCode}</strong><small>Expire {expiresAt ? new Date(expiresAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "dans 10 minutes"}</small></div>
+      <p className="phone-scan-instructions">Sur le téléphone, ouvre l’adresse de StockWise, ajoute <code>?phone-scan={pairingCode}</code> à l’URL si nécessaire, puis autorise la caméra. Garde cette page PC ouverte.</p>
+      <div className="product-form-actions"><button className="secondary-button" type="button" onClick={() => void closeSession()}>Déconnecter le téléphone</button><button className="secondary-button" type="button" onClick={() => void startSession()}>Générer un autre code</button></div>
+    </>}
+    {connectorError && <p className="catalog-error" role="alert">{connectorError}</p>}
+  </section>;
+}
+
+/** Page publique utilisée uniquement lorsque l’URL contient ?phone-scan=CODE. */
+function PhoneScanPage() {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const controlsRef = useRef<{ stop: () => void } | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [code, setCode] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [sending, setSending] = useState(false);
+  const pairingCode = new URLSearchParams(window.location.search).get("phone-scan")?.trim().toUpperCase() ?? "";
+  useEffect(() => () => { try { controlsRef.current?.stop(); } catch { /* caméra déjà fermée */ } }, []);
+
+  async function sendBarcode(value: string) {
+    const barcode = value.trim();
+    if (!barcode || !pairingCode || sending) return;
+    setSending(true); setError(""); setMessage("");
+    try {
+      const { error: rpcError } = await supabase.rpc("submit_phone_scan", { p_pairing_code: pairingCode, p_barcode: barcode });
+      if (rpcError) throw new Error(rpcError.message);
+      setCode(""); setMessage(`Code ${barcode} transmis au PC.`);
+    } catch (e) { setError(e instanceof Error ? e.message : "Le code n’a pas pu être transmis."); }
+    finally { setSending(false); }
+  }
+
+  async function startCamera() {
+    setError("");
+    if (!pairingCode) { setError("Code de connexion absent. Génère un code depuis le PC."); return; }
+    if (!navigator.mediaDevices?.getUserMedia) { setError("La caméra nécessite HTTPS et un navigateur compatible."); return; }
+    try {
+      const reader = new BrowserMultiFormatReader(); setScanning(true);
+      const controls = await reader.decodeFromVideoDevice(undefined, videoRef.current!, (result) => {
+        if (!result) return;
+        const value = result.getText().trim(); if (!value || sending) return;
+        try { controlsRef.current?.stop(); } catch { /* no-op */ }
+        controlsRef.current = null; setScanning(false); void sendBarcode(value);
+      });
+      controlsRef.current = controls;
+      if (!videoRef.current?.isConnected) { controls.stop(); controlsRef.current = null; setScanning(false); }
+    } catch (e) { setScanning(false); setError(e instanceof Error ? e.message : "Impossible d’ouvrir la caméra."); }
+  }
+  function stopCamera() { try { controlsRef.current?.stop(); } catch { /* no-op */ } controlsRef.current = null; setScanning(false); }
+
+  return <main className="phone-scan-page"><section className="product-form-card phone-scan-mobile-card"><Brand /><span className="section-eyebrow">CONNEXION TEMPORAIRE</span><h1>Scanner StockWise</h1><p>Scanne les codes-barres pour les transmettre au PC. Le scan seul ne modifie jamais le stock.</p>
+    {!pairingCode && <p className="catalog-error">Code absent. Reviens sur le PC et utilise le lien avec le code temporaire.</p>}
+    {error && <p className="catalog-error" role="alert">{error}</p>}{message && <div className="catalog-notice" role="status">{message}</div>}
+    <div className="stock-scan-video-wrap"><video ref={videoRef} className="stock-scan-video" muted playsInline aria-label="Caméra mobile pour scanner les codes-barres" />{!scanning && <div className="stock-scan-placeholder"><Icon name="scan" size={36} /><span>Caméra arrêtée</span></div>}{scanning && <div className="stock-scan-frame" aria-hidden="true" />}</div>
+    <div className="product-form-actions">{!scanning ? <button className="primary-button" type="button" onClick={() => void startCamera()} disabled={!pairingCode || sending}>Démarrer la caméra</button> : <button className="secondary-button" type="button" onClick={stopCamera}>Arrêter la caméra</button>}</div>
+    <form onSubmit={(e) => { e.preventDefault(); void sendBarcode(code); }}><label htmlFor="phone-barcode">Ou saisir le code manuellement</label><input id="phone-barcode" value={code} onChange={(e) => setCode(e.target.value)} autoComplete="off" required /><button className="primary-button" type="submit" disabled={!pairingCode || sending || !code.trim()}>{sending ? "Envoi…" : "Envoyer au PC"}</button></form>
+  </section></main>;
+}
+
 function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -48,9 +171,12 @@ function App() {
   const [error, setError] = useState("");
   const [shopError, setShopError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [activeModule, setActiveModule] = useState<"dashboard" | "products" | "stock" | "scanner">(
+  const [activeModule, setActiveModule] = useState<"dashboard" | "products" | "stock" | "scanner" | "sales" | "receipts">(
     "dashboard",
   );
+  const [dashboardMetrics, setDashboardMetrics] = useState({ productCount: 0, salesToday: 0, lowStockCount: 0, stockValue: 0, stockMovementCount: 0, salesCount: 0 });
+  const [dashboardLoading, setDashboardLoading] = useState(true);
+  const [dashboardError, setDashboardError] = useState("");
 
   useEffect(() => {
     let mounted = true;
@@ -147,6 +273,67 @@ function App() {
     };
   }, [user]);
 
+  useEffect(() => {
+    let cancelled = false;
+    function dateParts(date: Date, timeZone: string) {
+      const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+      const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      return { year: Number(values.year), month: Number(values.month), day: Number(values.day) };
+    }
+    function zonedMidnightToUtc(year: number, month: number, day: number, timeZone: string) {
+      const target = Date.UTC(year, month - 1, day);
+      let guess = target;
+      for (let i = 0; i < 3; i += 1) {
+        const parts = new Intl.DateTimeFormat("en-GB", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(new Date(guess));
+        const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+        const represented = Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day), Number(values.hour), Number(values.minute), Number(values.second));
+        guess += target - represented;
+      }
+      return new Date(guess).toISOString();
+    }
+    async function loadMetrics() {
+      if (!shop?.id) {
+        setDashboardMetrics({ productCount: 0, salesToday: 0, lowStockCount: 0, stockValue: 0, stockMovementCount: 0, salesCount: 0 });
+        setDashboardLoading(false); setDashboardError(""); return;
+      }
+      setDashboardLoading(true); setDashboardError("");
+      try {
+        const zone = shop.timezone || "Africa/Lubumbashi";
+        const parts = dateParts(new Date(), zone);
+        const start = zonedMidnightToUtc(parts.year, parts.month, parts.day, zone);
+        const tomorrow = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + 1));
+        const end = zonedMidnightToUtc(tomorrow.getUTCFullYear(), tomorrow.getUTCMonth() + 1, tomorrow.getUTCDate(), zone);
+        const [productsResult, variantsResult, salesResult, allSalesResult, stockMovementsResult] = await Promise.all([
+          supabase.from("products").select("id", { count: "exact", head: true }).eq("shop_id", shop.id).eq("is_active", true),
+          supabase.from("product_variants").select("stock_quantity, low_stock_threshold, purchase_price").eq("shop_id", shop.id).eq("is_active", true),
+          supabase.from("sales").select("total_amount").eq("shop_id", shop.id).gte("created_at", start).lt("created_at", end),
+          supabase.from("sales").select("id", { count: "exact", head: true }).eq("shop_id", shop.id),
+          supabase.from("stock_movements").select("id", { count: "exact", head: true }).eq("shop_id", shop.id),
+        ]);
+        if (productsResult.error) throw new Error(`Produits : ${productsResult.error.message}`);
+        if (variantsResult.error) throw new Error(`Stock : ${variantsResult.error.message}`);
+        if (salesResult.error) throw new Error(`Ventes : ${salesResult.error.message}`);
+        if (allSalesResult.error) throw new Error(`Historique des ventes : ${allSalesResult.error.message}`);
+        if (stockMovementsResult.error) throw new Error(`Mouvements de stock : ${stockMovementsResult.error.message}`);
+        if (cancelled) return;
+        const variants = variantsResult.data ?? [];
+        setDashboardMetrics({
+          productCount: productsResult.count ?? 0,
+          salesToday: (salesResult.data ?? []).reduce((sum, sale) => sum + Number(sale.total_amount ?? 0), 0),
+          lowStockCount: variants.filter((v) => Number(v.stock_quantity ?? 0) <= Number(v.low_stock_threshold ?? 0)).length,
+          stockValue: variants.reduce((sum, v) => sum + Number(v.stock_quantity ?? 0) * Number(v.purchase_price ?? 0), 0),
+          stockMovementCount: stockMovementsResult.count ?? 0,
+          salesCount: allSalesResult.count ?? 0,
+        });
+      } catch (err) {
+        if (!cancelled) setDashboardError(err instanceof Error ? err.message : "Impossible de charger les indicateurs.");
+      } finally { if (!cancelled) setDashboardLoading(false); }
+    }
+    void loadMetrics();
+    const timer = window.setInterval(() => { void loadMetrics(); }, 5 * 60 * 1000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [shop?.id, shop?.timezone]);
+
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
@@ -228,6 +415,8 @@ function App() {
     }
   }
 
+  if (new URLSearchParams(window.location.search).has("phone-scan")) return <PhoneScanPage />;
+
   if (loading) {
     return (
       <main className="auth-page auth-page-loading">
@@ -260,8 +449,8 @@ function App() {
         module: "stock" as const,
       },
       { label: "Scanner", icon: "scanner" as const, active: activeModule === "scanner", module: "scanner" as const },
-      { label: "Ventes", icon: "sales" as const, active: false },
-      { label: "Reçus", icon: "receipts" as const, active: false },
+      { label: "Ventes", icon: "sales" as const, active: activeModule === "sales", module: "sales" as const },
+      { label: "Reçus", icon: "receipts" as const, active: activeModule === "receipts", module: "receipts" as const },
     ];
 
     return (
@@ -279,18 +468,12 @@ function App() {
                 key={item.label}
                 className={`nav-item${item.active ? " nav-item-active" : ""}`}
                 type="button"
-                disabled={!("module" in item)}
                 onClick={() => {
                   if ("module" in item && item.module) {
                     setActiveModule(item.module);
                   }
                 }}
                 aria-current={item.active ? "page" : undefined}
-                title={
-                  !("module" in item)
-                    ? "Ce module sera disponible dans une prochaine étape"
-                    : undefined
-                }
               >
                 <Icon name={item.icon} />
                 <span>{item.label}</span>
@@ -318,7 +501,7 @@ function App() {
               <span>Espace de travail</span>
               <Icon name="chevron-right" size={15} />
               <strong>
-                {activeModule === "products" ? "Produits" : activeModule === "stock" ? "Gestion du stock" : activeModule === "scanner" ? "Scanner" : "Vue d'ensemble"}
+                {activeModule === "products" ? "Produits" : activeModule === "stock" ? "Gestion du stock" : activeModule === "scanner" ? "Scanner" : activeModule === "sales" ? "Ventes" : activeModule === "receipts" ? "Reçus" : "Vue d'ensemble"}
               </strong>
             </div>
 
@@ -357,6 +540,10 @@ function App() {
               <StockModule shop={shop} user={user} />
             ) : activeModule === "scanner" ? (
               <ScannerModule shop={shop} />
+            ) : activeModule === "sales" ? (
+              <SalesModule shop={shop} />
+            ) : activeModule === "receipts" ? (
+              <ReceiptsModule shop={shop} />
             ) : (
               <>
                 <section className="dashboard-welcome">
@@ -459,68 +646,31 @@ function App() {
                       aria-label="Indicateurs de la boutique"
                     >
                       <article className="metric-card">
-                        <div className="metric-topline">
-                          <span className="metric-icon metric-icon-green">
-                            <Icon name="products" size={20} />
-                          </span>
-                          <span className="metric-placeholder">
-                            À configurer
-                          </span>
-                        </div>
+                        <div className="metric-topline"><span className="metric-icon metric-icon-green"><Icon name="products" size={20} /></span><span className="metric-placeholder">{dashboardLoading ? "Chargement…" : dashboardError ? "Indisponible" : "En direct"}</span></div>
                         <p>Produits enregistrés</p>
-                        <div className="metric-value">—</div>
-                        <span className="metric-footnote">
-                          Après la création du catalogue
-                        </span>
+                        <div className="metric-value">{dashboardLoading ? "…" : dashboardMetrics.productCount}</div>
+                        <span className="metric-footnote">Produits actifs du catalogue</span>
                       </article>
                       <article className="metric-card">
-                        <div className="metric-topline">
-                          <span className="metric-icon metric-icon-blue">
-                            <Icon name="sales" size={20} />
-                          </span>
-                          <span className="metric-placeholder">
-                            À configurer
-                          </span>
-                        </div>
+                        <div className="metric-topline"><span className="metric-icon metric-icon-blue"><Icon name="sales" size={20} /></span><span className="metric-placeholder">{dashboardLoading ? "Chargement…" : dashboardError ? "Indisponible" : "Aujourd’hui"}</span></div>
                         <p>Ventes du jour</p>
-                        <div className="metric-value">—</div>
-                        <span className="metric-footnote">
-                          Après l'activation des ventes
-                        </span>
+                        <div className="metric-value">{dashboardLoading ? "…" : formatMoney(dashboardMetrics.salesToday, shop?.currency_code ?? "CDF")}</div>
+                        <span className="metric-footnote">Total des ventes enregistrées aujourd’hui</span>
                       </article>
                       <article className="metric-card">
-                        <div className="metric-topline">
-                          <span className="metric-icon metric-icon-amber">
-                            <Icon name="stock" size={20} />
-                          </span>
-                          <span className="metric-placeholder">
-                            À configurer
-                          </span>
-                        </div>
+                        <div className="metric-topline"><span className="metric-icon metric-icon-amber"><Icon name="stock" size={20} /></span><span className="metric-placeholder">{dashboardLoading ? "Chargement…" : dashboardError ? "Indisponible" : "En direct"}</span></div>
                         <p>Alertes de stock bas</p>
-                        <div className="metric-value">—</div>
-                        <span className="metric-footnote">
-                          Suivi dès que le stock sera activé
-                        </span>
+                        <div className="metric-value">{dashboardLoading ? "…" : dashboardMetrics.lowStockCount}</div>
+                        <span className="metric-footnote">Variantes au seuil d’alerte ou en dessous</span>
                       </article>
                       <article className="metric-card">
-                        <div className="metric-topline">
-                          <span className="metric-icon metric-icon-purple">
-                            <Icon name="wallet" size={20} />
-                          </span>
-                          <span className="metric-placeholder">
-                            À configurer
-                          </span>
-                        </div>
+                        <div className="metric-topline"><span className="metric-icon metric-icon-purple"><Icon name="wallet" size={20} /></span><span className="metric-placeholder">{dashboardLoading ? "Chargement…" : dashboardError ? "Indisponible" : "En direct"}</span></div>
                         <p>Valeur du stock</p>
-                        <div className="metric-value">
-                          — <small>{shop?.currency_code ?? "CDF"}</small>
-                        </div>
-                        <span className="metric-footnote">
-                          Calculée à partir des produits réels
-                        </span>
+                        <div className="metric-value">{dashboardLoading ? "…" : formatMoney(dashboardMetrics.stockValue, shop?.currency_code ?? "CDF")}</div>
+                        <span className="metric-footnote">Valeur estimée au prix d’achat</span>
                       </article>
                     </section>
+                    {dashboardError && <p className="catalog-error" role="alert">Les indicateurs n’ont pas pu être chargés : {dashboardError}</p>}
 
                     <section className="dashboard-lower-grid">
                       <article className="setup-card">
@@ -532,12 +682,12 @@ function App() {
                             <h2>Préparez votre boutique</h2>
                             <p>Quelques étapes pour démarrer avec StockWise.</p>
                           </div>
-                          <span className="setup-progress">0 sur 3</span>
+                          <span className="setup-progress">{Number(dashboardMetrics.productCount > 0) + Number(dashboardMetrics.stockMovementCount > 0) + Number(dashboardMetrics.salesCount > 0)} sur 3</span>
                         </div>
 
                         <div className="setup-steps">
-                          <div className="setup-step">
-                            <span className="step-number">1</span>
+                          <div className={`setup-step${dashboardMetrics.productCount > 0 ? " setup-step-complete" : ""}`}>
+                            <span className="step-number">{dashboardMetrics.productCount > 0 ? "✓" : "1"}</span>
                             <div className="step-copy">
                               <strong>Créer votre catalogue</strong>
                               <span>
@@ -545,10 +695,10 @@ function App() {
                                 couleurs.
                               </span>
                             </div>
-                            <span className="step-state">À venir</span>
+                            <span className="step-state">{dashboardLoading ? "Vérification…" : dashboardMetrics.productCount > 0 ? "Terminé" : "À faire"}</span>
                           </div>
-                          <div className="setup-step">
-                            <span className="step-number">2</span>
+                          <div className={`setup-step${dashboardMetrics.stockMovementCount > 0 ? " setup-step-complete" : ""}`}>
+                            <span className="step-number">{dashboardMetrics.stockMovementCount > 0 ? "✓" : "2"}</span>
                             <div className="step-copy">
                               <strong>Organiser le stock</strong>
                               <span>
@@ -556,17 +706,17 @@ function App() {
                                 boutique.
                               </span>
                             </div>
-                            <span className="step-state">À venir</span>
+                            <span className="step-state">{dashboardLoading ? "Vérification…" : dashboardMetrics.stockMovementCount > 0 ? "Terminé" : "À faire"}</span>
                           </div>
-                          <div className="setup-step">
-                            <span className="step-number">3</span>
+                          <div className={`setup-step${dashboardMetrics.salesCount > 0 ? " setup-step-complete" : ""}`}>
+                            <span className="step-number">{dashboardMetrics.salesCount > 0 ? "✓" : "3"}</span>
                             <div className="step-copy">
                               <strong>Enregistrer vos premières ventes</strong>
                               <span>
-                                Préparez le scanner et les reçus numériques.
+                                Enregistrez une vente pour valider cette étape.
                               </span>
                             </div>
-                            <span className="step-state">À venir</span>
+                            <span className="step-state">{dashboardLoading ? "Vérification…" : dashboardMetrics.salesCount > 0 ? "Terminé" : "À faire"}</span>
                           </div>
                         </div>
                       </article>
@@ -581,17 +731,18 @@ function App() {
                           <span className="quickstart-art-tag">SCAN</span>
                         </div>
                         <span className="section-eyebrow">
-                          BIENTÔT SUR STOCKWISE
+                          FONCTIONNALITÉ DISPONIBLE
                         </span>
                         <h2>Le stock, en un scan.</h2>
                         <p>
-                          Votre téléphone pourra servir à scanner les
-                          codes-barres pour retrouver un article et préparer les
-                          opérations de stock.
+                          Connectez votre téléphone pour scanner les codes-barres et transmettre les résultats à StockWise. La réception et les ventes restent contrôlées depuis votre ordinateur.
                         </p>
+                        <button className="secondary-button" type="button" onClick={() => setActiveModule("scanner")}>
+                          <Icon name="smartphone" size={16} /> Ouvrir le scanner
+                        </button>
                         <div className="quickstart-note">
-                          <Icon name="smartphone" size={17} />
-                          <span>Conçu pour fonctionner aussi sur iPhone.</span>
+                          <Icon name="shield" size={17} />
+                          <span>Le scan seul ne modifie pas le stock.</span>
                         </div>
                       </article>
                     </section>
@@ -1963,127 +2114,446 @@ type ScannedVariant = {
   supplier_barcode: string | null;
   status: string;
   variant_id: string;
+  item_kind: "individual" | "variant";
+  stock_quantity?: number;
   product_variants?: {
     sku: string;
     size: string | null;
     color: string | null;
+    stock_quantity?: number;
     products?: { name: string } | null;
   } | null;
 };
 
 function ScannerModule({ shop }: { shop: Shop | null }) {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const scannerControlsRef = useRef<{ stop: () => void } | null>(null);
-  const [scanning, setScanning] = useState(false);
   const [manualCode, setManualCode] = useState("");
   const [item, setItem] = useState<ScannedVariant | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [searching, setSearching] = useState(false);
 
-  useEffect(() => () => {
-    try { scannerControlsRef.current?.stop(); } catch { /* camera may already be stopped */ }
-    scannerControlsRef.current = null;
-  }, []);
 
   async function findItem(codeValue: string) {
     const code = codeValue.trim();
     if (!code || !shop) return;
-    setManualCode(code); setError(""); setMessage(""); setItem(null); setSearching(true);
+    setManualCode(code);
+    setError("");
+    setMessage("");
+    setItem(null);
+    setSearching(true);
+
     try {
-      const { data, error: queryError } = await supabase
+      // Priorité au code unique de la pièce physique.
+      const { data: individualItem, error: individualError } = await supabase
         .from("variant_items")
         .select("id, barcode, barcode_source, supplier_barcode, status, variant_id, product_variants(sku, size, color, products(name))")
         .eq("shop_id", shop.id)
         .eq("barcode", code)
         .maybeSingle();
-      if (queryError) throw new Error(queryError.message);
-      if (!data) {
-        setMessage("Aucune pièce trouvée pour ce code dans cette boutique.");
+
+      if (individualError) throw new Error(individualError.message);
+
+      if (individualItem) {
+        setItem({ ...(individualItem as unknown as ScannedVariant), item_kind: "individual" });
+        setMessage("Pièce individuelle retrouvée. Le stock n’a pas été modifié.");
         return;
       }
-      setItem(data as unknown as ScannedVariant);
-      setMessage("Pièce retrouvée dans StockWise.");
+
+      // Si ce n’est pas un code individuel, chercher le code de la variante.
+      const { data: variant, error: variantError } = await supabase
+        .from("product_variants")
+        .select("id, sku, barcode, size, color, stock_quantity, products(name)")
+        .eq("shop_id", shop.id)
+        .eq("barcode", code)
+        .maybeSingle();
+
+      if (variantError) throw new Error(variantError.message);
+
+      if (variant) {
+        setItem({
+          id: variant.id,
+          barcode: variant.barcode ?? code,
+          barcode_source: "variant",
+          supplier_barcode: null,
+          status: "variant",
+          variant_id: variant.id,
+          item_kind: "variant",
+          stock_quantity: variant.stock_quantity,
+          product_variants: {
+            sku: variant.sku,
+            size: variant.size,
+            color: variant.color,
+            stock_quantity: variant.stock_quantity,
+            products: Array.isArray(variant.products) ? variant.products[0] ?? null : variant.products,
+          },
+        } as ScannedVariant);
+        setMessage("Variante retrouvée. Le stock affiché correspond à la quantité totale de cette variante.");
+        return;
+      }
+
+      setMessage("Aucun article trouvé pour ce code dans cette boutique. Vérifie le code ou recherche l’article dans le catalogue.");
     } catch (lookupError) {
       setError(`Impossible de rechercher ce code : ${lookupError instanceof Error ? lookupError.message : "erreur inconnue"}`);
-    } finally { setSearching(false); }
-  }
-
-  async function startCamera() {
-    setError(""); setMessage(""); setItem(null);
-    if (!shop) { setError("La boutique n’est pas disponible."); return; }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError("La caméra nécessite un navigateur compatible et une connexion HTTPS. Ouvre StockWise avec son URL sécurisée sur ton téléphone.");
-      return;
-    }
-    try {
-      const reader = new BrowserMultiFormatReader();
-      setScanning(true);
-      const controls = await reader.decodeFromVideoDevice(undefined, videoRef.current!, (result, scanError) => {
-        if (result) {
-          const code = result.getText();
-          try { scannerControlsRef.current?.stop(); } catch { /* no-op */ }
-          scannerControlsRef.current = null;
-          setScanning(false);
-          void findItem(code);
-        }
-        // Les erreurs de décodage sans code sont normales pendant le scan.
-        void scanError;
-      });
-      scannerControlsRef.current = controls;
-      if (!videoRef.current || !videoRef.current.isConnected) {
-        controls.stop();
-        scannerControlsRef.current = null;
-        setScanning(false);
-      }
-    } catch (cameraError) {
-      setScanning(false);
-      setError(cameraError instanceof Error ? cameraError.message : "Impossible d’ouvrir la caméra. Vérifie les autorisations du navigateur.");
+    } finally {
+      setSearching(false);
     }
   }
 
-  function stopCamera() {
-    try { scannerControlsRef.current?.stop(); } catch { /* no-op */ }
-    scannerControlsRef.current = null;
-    setScanning(false);
-  }
 
   const statusLabel: Record<string, string> = {
     available: "Disponible",
     sold: "Vendu",
     return_pending_inspection: "Retour à inspecter",
     damaged: "Endommagé",
+    variant: "Variante du catalogue",
   };
 
   return (
     <section className="catalog-page stock-scan-page">
       <div className="catalog-heading">
-        <div><span className="section-eyebrow">LECTURE PAR CAMÉRA</span><h1>Scanner un article</h1><p>Utilise la caméra de ton téléphone pour retrouver un article par son code-barres.</p></div>
+        <div>
+          <span className="section-eyebrow">LECTURE PAR CODE-BARRES</span>
+          <h1>Scanner un article</h1>
+          <p>Scanne un code individuel pour identifier une pièce, ou le code de la variante pour consulter son stock total.</p>
+        </div>
       </div>
       {!shop && <p className="catalog-error" role="alert">La boutique n’est pas disponible.</p>}
       {error && <p className="catalog-error" role="alert">{error}</p>}
       {message && <div className="catalog-notice" role="status">{message}</div>}
-      <div className="product-form-card stock-scan-card">
-        <div className="product-form-heading"><div><h2>Scanner avec la caméra</h2><p>Place le code-barres CODE128 dans le cadre et garde le téléphone stable.</p></div></div>
-        <div className="stock-scan-video-wrap">
-          <video ref={videoRef} className="stock-scan-video" muted playsInline aria-label="Aperçu de la caméra pour scanner un code-barres" />
-          {!scanning && <div className="stock-scan-placeholder"><Icon name="scan" size={36} /><span>La caméra est arrêtée</span></div>}
-          {scanning && <div className="stock-scan-frame" aria-hidden="true" />}
-        </div>
-        <div className="product-form-actions stock-scan-actions">
-          {!scanning ? <button className="primary-button" type="button" onClick={() => void startCamera()} disabled={!shop || searching}><Icon name="scan" size={17} /> Démarrer le scan</button> : <button className="secondary-button" type="button" onClick={stopCamera}>Arrêter la caméra</button>}
-        </div>
-        <p className="stock-scan-help">La caméra fonctionne généralement uniquement sur HTTPS (ou localhost). Autorise l’accès à la caméra lorsque le navigateur le demande.</p>
-      </div>
+
+      <PhoneScanConnector shop={shop} title="Scanner" onBarcode={findItem} />
+
       <form className="product-form-card stock-scan-manual" onSubmit={(event) => { event.preventDefault(); void findItem(manualCode); }}>
-        <div className="product-form-heading"><div><h2>Recherche manuelle</h2><p>Tu peux aussi coller ou saisir le code-barres si la caméra ne le lit pas.</p></div></div>
-        <div className="product-form-grid stock-scan-manual-grid"><label>Code-barres *<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder="Ex. SW-..." autoComplete="off" required /></label><div className="product-form-actions"><button className="primary-button" type="submit" disabled={!shop || searching}>{searching ? "Recherche..." : "Rechercher la pièce"}</button></div></div>
+        <div className="product-form-heading">
+          <div>
+            <h2>Recherche manuelle</h2>
+            <p>Tu peux aussi coller ou saisir le code-barres si la caméra ne le lit pas.</p>
+          </div>
+        </div>
+        <div className="product-form-grid stock-scan-manual-grid">
+          <label>Code-barres *
+            <input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder="Ex. SW-..." autoComplete="off" required />
+          </label>
+          <div className="product-form-actions">
+            <button className="primary-button" type="submit" disabled={!shop || searching}>{searching ? "Recherche..." : "Rechercher l’article"}</button>
+          </div>
+        </div>
       </form>
-      {item && <article className="product-form-card stock-scan-result"><div className="product-form-heading"><div><h2>Pièce identifiée</h2><p>Résultat de la recherche dans l’inventaire individuel.</p></div></div><div className="stock-scan-result-grid"><div><span>Produit</span><strong>{item.product_variants?.products?.name ?? "Produit sans nom"}</strong></div><div><span>Taille</span><strong>{item.product_variants?.size ?? "—"}</strong></div><div><span>Couleur</span><strong>{item.product_variants?.color ?? "—"}</strong></div><div><span>Référence</span><strong>{item.product_variants?.sku ?? "—"}</strong></div><div><span>Code individuel</span><code>{item.barcode}</code></div><div><span>Statut</span><strong className={`stock-scan-status stock-scan-status-${item.status}`}>{statusLabel[item.status] ?? item.status}</strong></div></div></article>}
-      <p className="stock-scan-security"><Icon name="shield" size={16} /> La recherche est limitée à la boutique connectée. Le scan ne modifie pas le stock.</p>
+
+      {item && (
+        <article className="product-form-card stock-scan-result">
+          <div className="product-form-heading">
+            <div>
+              <h2>{item.item_kind === "individual" ? "Pièce identifiée" : "Variante identifiée"}</h2>
+              <p>{item.item_kind === "individual" ? "Résultat de la recherche dans l’inventaire individuel." : "Résultat du catalogue : le stock indiqué concerne toute cette variante."}</p>
+            </div>
+          </div>
+          <div className="stock-scan-result-grid">
+            <div><span>Produit</span><strong>{item.product_variants?.products?.name ?? "Produit sans nom"}</strong></div>
+            <div><span>Taille / pointure</span><strong>{item.product_variants?.size ?? "—"}</strong></div>
+            <div><span>Couleur</span><strong>{item.product_variants?.color ?? "—"}</strong></div>
+            <div><span>Référence</span><strong>{item.product_variants?.sku ?? "—"}</strong></div>
+            <div><span>{item.item_kind === "individual" ? "Code individuel" : "Code de variante"}</span><code>{item.barcode}</code></div>
+            {item.item_kind === "individual"
+              ? <div><span>Statut de la pièce</span><strong className={`stock-scan-status stock-scan-status-${item.status}`}>{statusLabel[item.status] ?? item.status}</strong></div>
+              : <div><span>Stock total de la variante</span><strong>{item.stock_quantity ?? item.product_variants?.stock_quantity ?? 0} pièce(s)</strong></div>}
+          </div>
+        </article>
+      )}
+      <p className="stock-scan-security"><Icon name="shield" size={16} /> La recherche est limitée à la boutique connectée. Le scan ne crée ni vente ni mouvement de stock.</p>
     </section>
   );
 }
+
+
+type SaleCartItem = {
+  id: string;
+  barcode: string;
+  variant_id: string;
+  productName: string;
+  sku: string;
+  size: string | null;
+  color: string | null;
+  unitPrice: number;
+};
+
+type SaleReceipt = {
+  id: string;
+  receipt_number: string;
+  total_amount: number;
+  item_count: number;
+  created_at: string;
+  items: SaleCartItem[];
+};
+
+function formatMoney(amount: number, currency = "CDF") {
+  return new Intl.NumberFormat("fr-FR", {
+    style: "currency",
+    currency,
+    maximumFractionDigits: 2,
+  }).format(amount);
+}
+
+function SalesModule({ shop }: { shop: Shop | null }) {
+  const [manualCode, setManualCode] = useState("");
+  const [cart, setCart] = useState<SaleCartItem[]>([]);
+  const [lookupBusy, setLookupBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [lastReceipt, setLastReceipt] = useState<SaleReceipt | null>(null);
+
+
+  const total = cart.reduce((sum, item) => sum + item.unitPrice, 0);
+  const currency = shop?.currency_code || "CDF";
+
+  async function findAndAddItem(codeValue: string) {
+    const code = codeValue.trim();
+    if (!code || !shop || lookupBusy || saving) return;
+    setManualCode(code);
+    setError("");
+    setMessage("");
+    setLookupBusy(true);
+    try {
+      const { data, error: lookupError } = await supabase
+        .from("variant_items")
+        .select("id, barcode, status, variant_id, product_variants(id, sku, size, color, selling_price, stock_quantity, is_active, products(name, is_active))")
+        .eq("shop_id", shop.id)
+        .eq("barcode", code)
+        .maybeSingle();
+
+      if (lookupError) throw new Error(lookupError.message);
+      if (!data) throw new Error("Aucun article individuel ne correspond à ce code dans cette boutique. Les codes de variante ne peuvent pas être vendus directement.");
+
+      const row = data as unknown as {
+        id: string;
+        barcode: string;
+        status: string;
+        variant_id: string;
+        product_variants: {
+          id: string;
+          sku: string;
+          size: string | null;
+          color: string | null;
+          selling_price: number;
+          stock_quantity: number;
+          is_active: boolean;
+          products: { name: string; is_active: boolean } | { name: string; is_active: boolean }[] | null;
+        } | null;
+      };
+      const variant = row.product_variants;
+      const product = Array.isArray(variant?.products) ? variant.products[0] : variant?.products;
+
+      if (row.status !== "available") {
+        throw new Error(`Cet article n’est pas disponible (statut : ${row.status}).`);
+      }
+      if (!variant || !variant.is_active || product?.is_active === false) {
+        throw new Error("Ce produit ou cette variante est inactif.");
+      }
+      if (variant.stock_quantity < 1) {
+        throw new Error("Le stock de cette variante est insuffisant.");
+      }
+      if (cart.some((item) => item.id === row.id)) {
+        throw new Error("Cet article est déjà présent dans le panier.");
+      }
+
+      const cartItem: SaleCartItem = {
+        id: row.id,
+        barcode: row.barcode,
+        variant_id: row.variant_id,
+        productName: product?.name ?? "Produit",
+        sku: variant.sku,
+        size: variant.size,
+        color: variant.color,
+        unitPrice: Number(variant.selling_price),
+      };
+      setCart((previous) => previous.some((item) => item.id === cartItem.id) ? previous : [...previous, cartItem]);
+      setManualCode("");
+      setMessage(`${cartItem.productName} ajouté au panier. Le stock n’a pas encore été modifié.`);
+    } catch (lookupError) {
+      setError(lookupError instanceof Error ? lookupError.message : "Impossible de vérifier cet article.");
+    } finally {
+      setLookupBusy(false);
+    }
+  }
+
+  async function confirmSale() {
+    if (!shop || cart.length === 0 || saving) return;
+    if (!window.confirm(`Confirmer la vente de ${cart.length} article(s) pour ${formatMoney(total, currency)} en espèces ?`)) return;
+
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const snapshot = [...cart];
+      const { data, error: saleError } = await supabase.rpc("complete_cash_sale", {
+        p_shop_id: shop.id,
+        p_variant_item_ids: snapshot.map((item) => item.id),
+      });
+      if (saleError) throw new Error(saleError.message);
+
+      const result = Array.isArray(data) ? data[0] : data;
+      if (!result?.sale_id || !result?.receipt_number) {
+        throw new Error("La vente a été envoyée, mais le reçu n’a pas pu être confirmé. Vérifie l’historique des ventes avant de réessayer.");
+      }
+
+      setLastReceipt({
+        id: result.sale_id,
+        receipt_number: result.receipt_number,
+        total_amount: Number(result.total_amount),
+        item_count: Number(result.item_count),
+        created_at: new Date().toISOString(),
+        items: snapshot,
+      });
+      setCart([]);
+      setManualCode("");
+      setMessage("Vente enregistrée avec succès. Le stock a été mis à jour.");
+    } catch (saleError) {
+      setError(`Vente non confirmée : ${saleError instanceof Error ? saleError.message : "erreur inconnue"}. Vérifie l’historique avant de relancer une vente.`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="catalog-page stock-sales-page">
+      <div className="catalog-heading">
+        <div>
+          <span className="section-eyebrow">ENCAISSEMENT</span>
+          <h1>Nouvelle vente</h1>
+          <p>Scanne chaque vêtement individuellement, puis confirme le paiement en espèces.</p>
+        </div>
+      </div>
+
+      {error && <p className="catalog-error" role="alert">{error}</p>}
+      {message && <div className="catalog-notice" role="status">{message}</div>}
+
+      <PhoneScanConnector shop={shop} title="Ventes" onBarcode={findAndAddItem} />
+
+      <div className="product-form-card stock-scan-card">
+        <div className="product-form-heading">
+          <div>
+            <h2>1. Ajouter les articles</h2>
+            <p>Scanne les articles avec le téléphone connecté ou saisis leur code-barres individuel ci-dessous.</p>
+          </div>
+        </div>
+        <form className="stock-scan-manual" onSubmit={(event) => { event.preventDefault(); void findAndAddItem(manualCode); }}>
+          <label htmlFor="sale-barcode">Code-barres individuel</label>
+          <div className="product-form-grid stock-scan-manual-grid">
+            <input id="sale-barcode" value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder="Ex. SW-..." autoComplete="off" required disabled={lookupBusy || saving} />
+            <div className="product-form-actions">
+              <button className="primary-button" type="submit" disabled={!shop || lookupBusy || saving || !manualCode.trim()}>{lookupBusy ? "Vérification..." : "Ajouter au panier"}</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <section className="product-form-card stock-sales-cart">
+        <div className="product-form-heading">
+          <div>
+            <h2>2. Panier</h2>
+            <p>{cart.length} article(s) · paiement en espèces</p>
+          </div>
+          {cart.length > 0 && <button className="secondary-button" type="button" onClick={() => setCart([])} disabled={saving}>Vider le panier</button>}
+        </div>
+        {cart.length === 0 ? (
+          <p className="stock-scan-help">Aucun article dans le panier. Scanne un code individuel pour commencer.</p>
+        ) : (
+          <div className="stock-sales-cart-list">
+            {cart.map((item) => (
+              <article className="stock-sales-cart-item" key={item.id}>
+                <div className="stock-sales-cart-item-main">
+                  <strong>{item.productName}</strong>
+                  <span>{[item.size, item.color, item.sku].filter(Boolean).join(" · ")}</span>
+                  <code>{item.barcode}</code>
+                </div>
+                <strong>{formatMoney(item.unitPrice, currency)}</strong>
+                <button className="secondary-button" type="button" onClick={() => setCart((previous) => previous.filter((row) => row.id !== item.id))} disabled={saving} aria-label={`Retirer ${item.productName} du panier`}>Retirer</button>
+              </article>
+            ))}
+          </div>
+        )}
+        <div className="stock-sales-total">
+          <span>Total à payer</span>
+          <strong>{formatMoney(total, currency)}</strong>
+        </div>
+        <div className="stock-sales-payment">
+          <span className="meta-pill-icon"><Icon name="wallet" size={18} /></span>
+          <div><strong>Espèces</strong><span>Le stock est modifié uniquement après confirmation.</span></div>
+        </div>
+        <button className="primary-button stock-sales-confirm" type="button" onClick={() => void confirmSale()} disabled={!shop || cart.length === 0 || saving}>
+          {saving ? "Enregistrement de la vente..." : "Confirmer la vente"}
+        </button>
+      </section>
+
+      {lastReceipt && (
+        <section className="product-form-card stock-sales-receipt" aria-label="Reçu de la dernière vente">
+          <div className="product-form-heading">
+            <div><span className="section-eyebrow">VENTE CONFIRMÉE</span><h2>Reçu {lastReceipt.receipt_number}</h2><p>{new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium", timeStyle: "short", timeZone: shop?.timezone || "Africa/Lubumbashi" }).format(new Date(lastReceipt.created_at))}</p></div>
+            <button className="secondary-button no-print" type="button" onClick={() => window.print()}>Imprimer le reçu</button>
+          </div>
+          <div className="stock-sales-receipt-items">
+            {lastReceipt.items.map((item) => <div className="stock-sales-receipt-row" key={item.id}><span>{item.productName} · {item.barcode}</span><strong>{formatMoney(item.unitPrice, currency)}</strong></div>)}
+          </div>
+          <div className="stock-sales-total"><span>Total payé en espèces</span><strong>{formatMoney(lastReceipt.total_amount, currency)}</strong></div>
+          <p className="stock-scan-help">Conserve ce numéro de reçu pour retrouver la vente dans le module Reçus.</p>
+        </section>
+      )}
+      <p className="stock-scan-security"><Icon name="shield" size={16} /> Chaque article ne peut être vendu qu’une seule fois. Le serveur revérifie le statut, le stock et le prix au moment de la confirmation.</p>
+    </section>
+  );
+}
+
+type SaleHistoryRow = {
+  id: string;
+  receipt_number: string;
+  total_amount: number;
+  payment_method: string;
+  created_at: string;
+};
+
+function ReceiptsModule({ shop }: { shop: Shop | null }) {
+  const [sales, setSales] = useState<SaleHistoryRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadSales() {
+      if (!shop) { setSales([]); setLoading(false); return; }
+      setLoading(true);
+      setError("");
+      const { data, error: queryError } = await supabase
+        .from("sales")
+        .select("id, receipt_number, total_amount, payment_method, created_at")
+        .eq("shop_id", shop.id)
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (cancelled) return;
+      if (queryError) setError(`Impossible de charger les reçus : ${queryError.message}`);
+      else setSales((data ?? []) as SaleHistoryRow[]);
+      setLoading(false);
+    }
+    void loadSales();
+    return () => { cancelled = true; };
+  }, [shop?.id]);
+
+  return (
+    <section className="catalog-page stock-receipts-page">
+      <div className="catalog-heading"><div><span className="section-eyebrow">HISTORIQUE DES VENTES</span><h1>Reçus</h1><p>Retrouve les ventes enregistrées dans cette boutique.</p></div></div>
+      {error && <p className="catalog-error" role="alert">{error}</p>}
+      {loading ? <div className="shop-feedback" role="status"><span className="loading-spinner" aria-hidden="true" /><div><strong>Chargement des reçus</strong><p>Récupération de l’historique...</p></div></div>
+        : sales.length === 0 ? <div className="product-form-card"><h2>Aucune vente enregistrée</h2><p>Les reçus apparaîtront ici après la confirmation d’une vente.</p></div>
+        : <div className="product-form-card stock-receipts-list">
+            {sales.map((sale) => <article className="stock-receipt-row" key={sale.id}>
+              <div><strong>{sale.receipt_number}</strong><span>{new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium", timeStyle: "short", timeZone: shop?.timezone || "Africa/Lubumbashi" }).format(new Date(sale.created_at))}</span></div>
+              <div><strong>{formatMoney(Number(sale.total_amount), shop?.currency_code || "CDF")}</strong><span>Paiement en espèces</span></div>
+            </article>)}
+          </div>}
+    </section>
+  );
+}
+
 
 type StockVariantRow = {
   id: string; product_id: string; sku: string; barcode: string | null;
@@ -2108,16 +2578,20 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
   const [movements, setMovements] = useState<StockMovementRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [movementType, setMovementType] = useState<"in" | "out">("in");
-  const [movementKind, setMovementKind] = useState<"opening" | "purchase" | "supplier_return" | "loss" | "adjustment">("purchase");
+  const [movementType, setMovementType] = useState<"in" | "out">("out");
+  const [movementKind, setMovementKind] = useState<"opening" | "purchase" | "supplier_return" | "loss" | "adjustment">("loss");
   const [variantId, setVariantId] = useState("");
   const [quantity, setQuantity] = useState("1");
   const [reason, setReason] = useState("");
   const [search, setSearch] = useState("");
+  const [productPage, setProductPage] = useState(1);
+  const productPageSize = 10;
   const [historySearch, setHistorySearch] = useState("");
   const [historyType, setHistoryType] = useState("all");
   const [historyFrom, setHistoryFrom] = useState("");
   const [historyTo, setHistoryTo] = useState("");
+  const [historyPage, setHistoryPage] = useState(1);
+  const historyPageSize = 10;
   const [countVariantId, setCountVariantId] = useState("");
   const [countedQuantity, setCountedQuantity] = useState("");
   const [countReason, setCountReason] = useState("Comptage physique");
@@ -2127,109 +2601,67 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
   const [showReceiptForm, setShowReceiptForm] = useState(true);
   const [receiptVariantId, setReceiptVariantId] = useState("");
   const [receiptQuantity, setReceiptQuantity] = useState("1");
+  const [receiptStep, setReceiptStep] = useState<1 | 2 | 3>(1);
+  const [receiptExpectedByVariant, setReceiptExpectedByVariant] = useState<Record<string, number>>({});
   const [receiptBarcodes, setReceiptBarcodes] = useState("");
+  const [receiptDraftItems, setReceiptDraftItems] = useState<Array<{ key: string; variantId: string; barcode: string | null }>>([]);
   const [receiptReason, setReceiptReason] = useState("Réception fournisseur");
   const [receiptSaving, setReceiptSaving] = useState(false);
   const [receivedItems, setReceivedItems] = useState<ReceivedItemRow[]>([]);
   const [activeStockTab, setActiveStockTab] = useState<"receipt" | "inventory" | "operations">("receipt");
-  const receiptVideoRef = useRef<HTMLVideoElement | null>(null);
-  const receiptScannerControlsRef = useRef<{ stop: () => void } | null>(null);
-  const [receiptScanning, setReceiptScanning] = useState(false);
   const [receiptScanMessage, setReceiptScanMessage] = useState("");
-
-  useEffect(() => () => {
-    try { receiptScannerControlsRef.current?.stop(); } catch { /* caméra déjà arrêtée */ }
-    receiptScannerControlsRef.current = null;
-  }, []);
 
   async function handleReceiptScannedCode(codeValue: string) {
     const code = codeValue.trim();
     if (!code || !shop) return;
-    setError("");
-    setReceiptScanMessage("");
+    setError(""); setReceiptScanMessage("");
     try {
-      // First, prevent receiving the same individually registered piece twice.
-      const { data: existingItem, error: itemLookupError } = await supabase
-        .from("variant_items")
+      // An individual item barcode must never be received twice.
+      const { data: existingItem, error: itemLookupError } = await supabase.from("variant_items")
         .select("id, barcode, status, product_variants(sku, size, color, products(name))")
-        .eq("shop_id", shop.id)
-        .eq("barcode", code)
-        .maybeSingle();
+        .eq("shop_id", shop.id).eq("barcode", code).maybeSingle();
       if (itemLookupError) throw new Error(itemLookupError.message);
       if (existingItem) {
-        const details = existingItem as unknown as {
-          barcode: string; status: string;
-          product_variants?: { sku?: string; size?: string | null; color?: string | null; products?: { name?: string } | null } | null;
-        };
-        setReceiptScanMessage(`Ce code est déjà enregistré pour « ${details.product_variants?.products?.name ?? "un article"} » (${details.status}). Aucune nouvelle pièce n’a été ajoutée.`);
+        const details = existingItem as unknown as { status: string; product_variants?: { products?: { name?: string } | null } | null };
+        setReceiptScanMessage(`Code déjà enregistré pour « ${details.product_variants?.products?.name ?? "un article"} » (${details.status}). Il n’a pas été ajouté.`);
         return;
       }
-
-      // A variant-level barcode identifies the model/variant, not a unique physical piece.
-      // Select that variant, but let the receive function generate individual StockWise codes.
-      const { data: matchingVariant, error: variantLookupError } = await supabase
-        .from("product_variants")
-        .select("id, sku, size, color, barcode, products(name)")
-        .eq("shop_id", shop.id)
-        .eq("barcode", code)
-        .eq("is_active", true)
-        .maybeSingle();
+      if (receiptDraftItems.some((item) => item.barcode === code)) {
+        setReceiptScanMessage("Ce code figure déjà dans la liste de réception. Il n’a pas été ajouté une deuxième fois."); return;
+      }
+      // A barcode attached to the variant is a model code, not a unique item code.
+      const { data: matchingVariant, error: variantLookupError } = await supabase.from("product_variants")
+        .select("id, sku, size, color, barcode, products(name)").eq("shop_id", shop.id).eq("barcode", code).eq("is_active", true).maybeSingle();
       if (variantLookupError) throw new Error(variantLookupError.message);
       if (matchingVariant) {
-        const match = matchingVariant as unknown as { id: string; sku: string; size: string | null; color: string | null; products?: { name: string } | null };
+        const match = matchingVariant as unknown as { id: string; size: string | null; color: string | null; products?: { name: string } | null };
         setReceiptVariantId(match.id);
-        setReceiptScanMessage(`Variante retrouvée : « ${match.products?.name ?? "Produit"} »${match.size ? ` · ${match.size}` : ""}${match.color ? ` · ${match.color}` : ""}. Le code du modèle n’est pas ajouté comme code individuel : StockWise générera un code unique pour chaque pièce reçue.`);
+        setReceiptScanMessage(`Code du modèle reconnu pour « ${match.products?.name ?? "Produit" } ». Il ne sera pas réutilisé comme code individuel. Ajoute la pièce manuellement ou scanne son code individuel.`);
         return;
       }
-
-      // Unknown supplier code: keep it ready, then let the user choose the matching
-      // existing variant in the form. No product or database record is created by scanning.
-      setReceiptBarcodes((current) => {
-        const codes = current.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
-        return codes.includes(code) ? current : (current.trim() ? `${current.trim()}\n${code}` : code);
-      });
-      setReceiptScanMessage(`Code inconnu dans StockWise : ${code}. Choisis la variante existante dans « Produit / taille / couleur ». Si c’est un nouveau produit, crée-le d’abord dans Produits, puis reviens ici pour la réception.`);
+      if (!receiptVariantId) {
+        setReceiptBarcodes(code);
+        setReceiptScanMessage(`Code fournisseur ${code} détecté. Sélectionne d’abord la variante, puis clique sur « Ajouter la pièce scannée ».`);
+        return;
+      }
+      setReceiptDraftItems((items) => [...items, { key: `${Date.now()}-${Math.random()}`, variantId: receiptVariantId, barcode: code }]);
+      setReceiptBarcodes("");
+      setReceiptScanMessage(`Article ajouté à la liste (${receiptDraftItems.length + 1}). Scanne le suivant ou ajoute une pièce manuellement.`);
     } catch (lookupError) {
       setError(`Recherche du code impossible : ${lookupError instanceof Error ? lookupError.message : "erreur inconnue"}`);
     }
   }
 
-  async function startReceiptCamera() {
-    setError("");
-    setReceiptScanMessage("");
-    if (!shop) { setError("La boutique n’est pas disponible."); return; }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError("La caméra nécessite HTTPS. Ouvre StockWise avec son adresse sécurisée sur ton téléphone.");
+  function addManualReceiptItem() {
+    if (!receiptVariantId) { setError("Choisis la variante avant d’ajouter une pièce manuellement."); return; }
+    const typed = receiptBarcodes.trim();
+    if (typed && receiptDraftItems.some((item) => item.barcode === typed)) { setError("Ce code est déjà dans la liste."); return; }
+    if (typed) {
+      void handleReceiptScannedCode(typed);
       return;
     }
-    try {
-      const reader = new BrowserMultiFormatReader();
-      setReceiptScanning(true);
-      const controls = await reader.decodeFromVideoDevice(undefined, receiptVideoRef.current!, (result) => {
-        if (!result) return;
-        const code = result.getText().trim();
-        if (!code) return;
-        try { receiptScannerControlsRef.current?.stop(); } catch { /* no-op */ }
-        receiptScannerControlsRef.current = null;
-        setReceiptScanning(false);
-        void handleReceiptScannedCode(code);
-      });
-      receiptScannerControlsRef.current = controls;
-      if (!receiptVideoRef.current || !receiptVideoRef.current.isConnected) {
-        controls.stop();
-        receiptScannerControlsRef.current = null;
-        setReceiptScanning(false);
-      }
-    } catch (cameraError) {
-      setReceiptScanning(false);
-      setError(cameraError instanceof Error ? cameraError.message : "Impossible d’ouvrir la caméra. Vérifie les autorisations du navigateur.");
-    }
-  }
-
-  function stopReceiptCamera() {
-    try { receiptScannerControlsRef.current?.stop(); } catch { /* no-op */ }
-    receiptScannerControlsRef.current = null;
-    setReceiptScanning(false);
+    setReceiptDraftItems((items) => [...items, { key: `${Date.now()}-${Math.random()}`, variantId: receiptVariantId, barcode: null }]);
+    setError("");
   }
 
   async function loadStock() {
@@ -2261,6 +2693,8 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
     const query = search.trim().toLocaleLowerCase();
     return !query || `${variant.products?.name ?? ""} ${variant.sku} ${variant.barcode ?? ""} ${variant.size ?? ""} ${variant.color ?? ""}`.toLocaleLowerCase().includes(query);
   });
+  const productPageCount = Math.max(1, Math.ceil(filteredVariants.length / productPageSize));
+  const paginatedVariants = filteredVariants.slice((productPage - 1) * productPageSize, productPage * productPageSize);
   const variantById = new Map(variants.map((variant) => [variant.id, variant]));
   const movementLabels: Record<string, string> = {
     opening: "Stock initial", purchase: "Réapprovisionnement", sale: "Vente",
@@ -2286,45 +2720,68 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
       && (!historyTo || dateKey <= historyTo)
       && (!query || searchable.includes(query));
   });
+  const historyPageCount = Math.max(1, Math.ceil(filteredMovements.length / historyPageSize));
+  const paginatedMovements = filteredMovements.slice(
+    (historyPage - 1) * historyPageSize,
+    historyPage * historyPageSize,
+  );
+
+  useEffect(() => {
+    setProductPage(1);
+  }, [search]);
+
+  useEffect(() => {
+    if (productPage > productPageCount) setProductPage(productPageCount);
+  }, [productPage, productPageCount]);
+
+  useEffect(() => {
+    setHistoryPage(1);
+  }, [historySearch, historyType, historyFrom, historyTo]);
+
+  useEffect(() => {
+    if (historyPage > historyPageCount) setHistoryPage(historyPageCount);
+  }, [historyPage, historyPageCount]);
 
   async function handleReceiveItems(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!shop) { setError("La boutique n’est pas disponible."); return; }
-    const parsedQuantity = Number(receiptQuantity);
-    if (!receiptVariantId) { setError("Choisis la variante à réceptionner."); return; }
-    if (!Number.isInteger(parsedQuantity) || parsedQuantity < 1 || parsedQuantity > 500) {
-      setError("La quantité doit être un nombre entier entre 1 et 500 par réception.");
-      return;
-    }
-    const supplierCodes = receiptBarcodes
-      .split(/\r?\n/)
-      .map((code) => code.trim())
-      .filter(Boolean);
-    if (supplierCodes.length > parsedQuantity) {
-      setError(`Tu as saisi ${supplierCodes.length} code(s), mais la quantité reçue est de ${parsedQuantity}.`);
-      return;
+    if (receiptDraftItems.length === 0) { setError("Ajoute ou scanne au moins une pièce avant de valider. La quantité seule ne crée plus d’articles automatiquement."); return; }
+    const expectedEntries = Object.entries(receiptExpectedByVariant);
+    if (expectedEntries.length === 0) { setError("Ajoute au moins une variante à la réception."); return; }
+    for (const [expectedVariantId, expectedCount] of expectedEntries) {
+      const actualCount = receiptDraftItems.filter((item) => item.variantId === expectedVariantId).length;
+      if (actualCount !== expectedCount) {
+        const v = variants.find((variant) => variant.id === expectedVariantId);
+        setError(`${v?.products?.name ?? "Variante"}${v?.size ? ` · ${v.size}` : ""}${v?.color ? ` · ${v.color}` : ""} : ${expectedCount} pièce(s) attendue(s), ${actualCount} ajoutée(s). Complète la liste ou corrige la quantité.`);
+        setReceiptStep(2);
+        setReceiptVariantId(expectedVariantId);
+        setReceiptQuantity(String(expectedCount));
+        return;
+      }
     }
     setReceiptSaving(true); setError(""); setFeedback(""); setReceivedItems([]);
     try {
-      const items = Array.from({ length: parsedQuantity }, (_, index) => ({
-        supplier_barcode: supplierCodes[index] || null,
-      }));
-      const { data, error: rpcError } = await supabase.rpc("receive_variant_items", {
-        p_shop_id: shop.id,
-        p_variant_id: receiptVariantId,
-        p_items: items,
-        p_reason: receiptReason.trim() || "Réception de marchandises",
-      });
-      if (rpcError) throw new Error(`Réception non enregistrée : ${rpcError.message}`);
-      const result = (data ?? []) as ReceivedItemRow[];
-      if (result.length !== parsedQuantity) {
-        throw new Error("La réception a été envoyée, mais la liste des codes reçus est incomplète. Actualise le stock avant de réessayer.");
+      // Group only at submission because the existing RPC accepts one variant per call.
+      const groups = new Map<string, Array<{ supplier_barcode: string | null }>>();
+      for (const item of receiptDraftItems) {
+        const rows = groups.get(item.variantId) ?? [];
+        rows.push({ supplier_barcode: item.barcode }); groups.set(item.variantId, rows);
       }
-      setReceivedItems(result);
-      const chosenVariant = variants.find((variant) => variant.id === receiptVariantId);
-      setFeedback(`Réception enregistrée : ${result.length} pièce(s) pour « ${chosenVariant?.products?.name ?? "Produit"} ». Le stock a été mis à jour.`);
-      setReceiptQuantity("1");
-      setReceiptBarcodes("");
+      const allResults: ReceivedItemRow[] = [];
+      for (const [groupVariantId, items] of groups) {
+        const { data, error: rpcError } = await supabase.rpc("receive_variant_items", {
+          p_shop_id: shop.id, p_variant_id: groupVariantId, p_items: items,
+          p_reason: receiptReason.trim() || "Réception de marchandises",
+        });
+        if (rpcError) throw new Error(`Réception non enregistrée : ${rpcError.message}`);
+        const result = (data ?? []) as ReceivedItemRow[];
+        if (result.length !== items.length) throw new Error("La réception a été envoyée, mais la liste des codes reçus est incomplète. Actualise le stock avant de réessayer.");
+        allResults.push(...result.map((item) => ({ ...item, _variantId: groupVariantId } as ReceivedItemRow)));
+      }
+      setReceivedItems(allResults);
+      setFeedback(`Réception enregistrée : ${allResults.length} pièce(s) répartie(s) sur ${groups.size} variante(s). Le stock a été mis à jour.`);
+      setReceiptQuantity("1"); setReceiptBarcodes(""); setReceiptDraftItems([]);
+      setReceiptExpectedByVariant({}); setReceiptStep(1); setReceiptVariantId("");
       await loadStock();
     } catch (receiveError) {
       setError(receiveError instanceof Error ? receiveError.message : "Une erreur est survenue pendant la réception.");
@@ -2405,6 +2862,19 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
         .stock-received-label code { display: block; font-size: 9pt; margin: 3px 0 0; overflow-wrap: anywhere; }
         .stock-barcode-graphic { display: block; width: 100%; max-width: 58mm; height: 13mm; margin: 4px auto 2px; }
         .stock-label-variant { display: flex; justify-content: center; gap: 5px; font-size: 9pt; margin-top: 3px; }
+        .stock-receipt-wizard-progress { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:18px 0 22px; }
+        .stock-receipt-wizard-step { display:flex; align-items:center; gap:9px; padding:10px; border:1px solid var(--border, #dce8e0); border-radius:12px; color:var(--muted, #64748b); }
+        .stock-receipt-wizard-step > span { display:grid; place-items:center; width:28px; height:28px; border-radius:50%; background:#eef3ef; font-weight:700; flex-shrink:0; }
+        .stock-receipt-wizard-step.is-active { border-color:#168052; background:#f2faf5; color:#126b45; }
+        .stock-receipt-wizard-step.is-complete > span { background:#168052; color:white; }
+        .stock-receipt-wizard-step small { font-size:12px; font-weight:600; }
+        .stock-receipt-wizard-panel { border:1px solid #e1ebe4; border-radius:14px; padding:20px; margin-bottom:16px; }
+        .stock-receipt-wizard-panel h3 { margin:0 0 8px; }
+        .stock-receipt-wizard-panel > p { color:#64748b; margin:0 0 18px; }
+        .stock-receipt-progress-count { display:flex; align-items:baseline; gap:10px; padding:14px; background:#f2faf5; border-radius:10px; margin:12px 0 18px; }
+        .stock-receipt-progress-count strong { font-size:24px; color:#147a4d; }
+        .stock-receipt-progress-count span { color:#64748b; font-size:13px; }
+        @media (max-width: 640px) { .stock-receipt-wizard-progress { gap:5px; } .stock-receipt-wizard-step { flex-direction:column; align-items:flex-start; padding:8px; gap:5px; } .stock-receipt-wizard-step small { font-size:10px; } .stock-receipt-wizard-panel { padding:14px; } }
         .stock-received-label > span { display: block; font-size: 8pt; }
         @page { margin: 8mm; }
       }`}</style>
@@ -2433,51 +2903,68 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
           <div>
             <span className="section-eyebrow">NOUVELLE FONCTIONNALITÉ</span>
             <h2>Réceptionner des articles</h2>
-            <p>Une fiche de stock et un code-barres individuel seront créés pour chaque article reçu.</p>
+            <p>Ajoute chaque pièce en la scannant ou manuellement. Les codes StockWise sont générés uniquement pour les pièces sans code fournisseur individuel.</p>
           </div>
           <button className="secondary-button" type="button" onClick={() => setShowReceiptForm((value) => !value)}>
             {showReceiptForm ? "Réduire" : "Nouvelle réception"}
           </button>
         </div>
         {showReceiptForm && <form onSubmit={handleReceiveItems}>
-          <div className="product-form-grid stock-movement-grid">
-            <label>Produit / taille / couleur *
-              <select value={receiptVariantId} onChange={(event) => setReceiptVariantId(event.target.value)} required>
-                <option value="">Choisir une variante</option>
-                {variants.map((variant) => <option key={variant.id} value={variant.id}>{variant.products?.name ?? "Produit sans nom"}{variant.size ? ` · ${variant.size}` : ""}{variant.color ? ` · ${variant.color}` : ""} — {variant.sku} (stock : {variant.stock_quantity})</option>)}
-              </select>
-            </label>
-            <label>Quantité reçue *
-              <input type="number" min="1" max="500" step="1" inputMode="numeric" value={receiptQuantity} onChange={(event) => setReceiptQuantity(event.target.value)} required />
-            </label>
-            <label className="stock-receipt-reason">Note de réception
-              <input value={receiptReason} onChange={(event) => setReceiptReason(event.target.value)} maxLength={250} placeholder="Ex. Livraison fournisseur" />
-            </label>
-            <label className="stock-receipt-codes">Codes-barres fournisseur (facultatif)
-              <textarea value={receiptBarcodes} onChange={(event) => { setReceiptBarcodes(event.target.value); setReceiptScanMessage(""); }} rows={4} autoComplete="off" placeholder={"Un code par ligne. Tu peux les saisir ou utiliser la caméra du téléphone.\nEx. 3601234567890"} />
-              <small>À chaque scan, StockWise vérifie d’abord si le code correspond à une pièce déjà enregistrée ou à une variante existante. Les codes de modèle partagés ne sont pas réutilisés comme codes individuels ; StockWise génère alors des codes uniques par pièce.</small>
-            </label>
-            <div className="stock-receipt-phone-scanner">
-              <div className="stock-receipt-scanner-actions">
-                {!receiptScanning ? <button className="secondary-button" type="button" onClick={() => void startReceiptCamera()} disabled={!shop || receiptSaving}><Icon name="scan" size={17} /> Scanner avec mon téléphone</button> : <button className="secondary-button" type="button" onClick={stopReceiptCamera}>Arrêter le scanner</button>}
-                {receiptScanMessage && <span className="stock-receipt-scan-message" role="status">{receiptScanMessage}</span>}
-              </div>
-              <div className="stock-receipt-camera-wrap" style={{ display: receiptScanning ? "block" : "none" }}><div className="stock-receipt-camera-preview"><video ref={receiptVideoRef} className="stock-scan-video" muted playsInline aria-label="Caméra pour scanner le code fournisseur" /><div className="stock-scan-frame" aria-hidden="true" /></div><p>Cadre un seul code-barres à la fois. Après la lecture, le code sera traité automatiquement.</p></div>
-              <small>La caméra nécessite une connexion HTTPS et l’autorisation du navigateur. Le code lu est ajouté automatiquement au champ si c’est un code fournisseur inconnu. Pour scanner un autre article, relance le scanner.</small>
+          <div className="stock-receipt-wizard-progress" aria-label={`Étape ${receiptStep} sur 3`}>
+            {["Choisir la variante", "Ajouter les pièces", "Vérifier"].map((label, index) => <div key={label} className={`stock-receipt-wizard-step${receiptStep === index + 1 ? " is-active" : ""}${receiptStep > index + 1 ? " is-complete" : ""}`}><span>{receiptStep > index + 1 ? "✓" : index + 1}</span><small>{label}</small></div>)}
+          </div>
+          {receiptStep === 1 && <div className="stock-receipt-wizard-panel">
+            <h3>1. Quelle variante reçois-tu ?</h3>
+            <p>Choisis un produit, sa taille et sa couleur, puis indique combien de pièces tu attends pour cette variante.</p>
+            <div className="product-form-grid stock-movement-grid">
+              <label>Produit / taille / couleur *
+                <select value={receiptVariantId} onChange={(event) => { setReceiptVariantId(event.target.value); setReceiptQuantity(String(receiptExpectedByVariant[event.target.value] ?? 1)); setError(""); }} required>
+                  <option value="">Choisir une variante</option>
+                  {variants.map((variant) => <option key={variant.id} value={variant.id}>{variant.products?.name ?? "Produit sans nom"}{variant.size ? ` · ${variant.size}` : ""}{variant.color ? ` · ${variant.color}` : ""} — {variant.sku} (stock : {variant.stock_quantity})</option>)}
+                </select>
+              </label>
+              <label>Nombre de pièces attendu *
+                <input type="number" min="1" max="500" step="1" inputMode="numeric" value={receiptQuantity} onChange={(event) => setReceiptQuantity(event.target.value)} required />
+              </label>
+              <label className="stock-receipt-reason">Note de réception
+                <input value={receiptReason} onChange={(event) => setReceiptReason(event.target.value)} maxLength={250} placeholder="Ex. Livraison fournisseur" />
+              </label>
             </div>
-          </div>
-          <div className="product-form-actions">
-            <button className="secondary-button" type="button" onClick={() => { setReceiptVariantId(""); setReceiptQuantity("1"); setReceiptBarcodes(""); setReceiptReason("Réception fournisseur"); setError(""); }}>Réinitialiser</button>
-            <button className="primary-button" type="submit" disabled={receiptSaving || loading || !shop || variants.length === 0}>{receiptSaving ? "Réception en cours..." : "Valider la réception"}</button>
-          </div>
+            <div className="product-form-actions"><button className="primary-button" type="button" disabled={!receiptVariantId || !Number.isInteger(Number(receiptQuantity)) || Number(receiptQuantity) < 1 || Number(receiptQuantity) > 500} onClick={() => { setReceiptExpectedByVariant((previous) => ({ ...previous, [receiptVariantId]: Number(receiptQuantity) })); setReceiptBarcodes(""); setReceiptScanMessage(""); setError(""); setReceiptStep(2); }}>Continuer →</button></div>
+          </div>}
+          {receiptStep === 2 && <div className="stock-receipt-wizard-panel">
+            <h3>2. Ajoute les pièces</h3>
+            <p>{(() => { const v = variants.find((variant) => variant.id === receiptVariantId); return `${v?.products?.name ?? "Produit"}${v?.size ? ` · ${v.size}` : ""}${v?.color ? ` · ${v.color}` : ""}`; })()} · Objectif : {receiptExpectedByVariant[receiptVariantId] ?? Number(receiptQuantity)} pièce(s)</p>
+            <div className="stock-receipt-progress-count"><strong>{receiptDraftItems.filter((item) => item.variantId === receiptVariantId).length} / {receiptExpectedByVariant[receiptVariantId] ?? Number(receiptQuantity)}</strong><span>pièces ajoutées pour cette variante</span></div>
+            <PhoneScanConnector shop={shop} title="Réception · variante sélectionnée" onBarcode={handleReceiptScannedCode} />
+            <label className="stock-receipt-codes">Code-barres individuel (facultatif)
+              <input value={receiptBarcodes} onChange={(event) => { setReceiptBarcodes(event.target.value); setReceiptScanMessage(""); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addManualReceiptItem(); } }} autoComplete="off" placeholder="Saisir ou scanner un code individuel" />
+              <small>Chaque code scanné doit identifier une seule pièce. Si l’article n’a pas de code individuel, laisse ce champ vide.</small>
+            </label>
+            <div className="stock-receipt-scanner-actions">
+              <button className="secondary-button" type="button" onClick={addManualReceiptItem} disabled={receiptSaving}>＋ {receiptBarcodes.trim() ? "Ajouter ce code" : "Ajouter sans code-barres"}</button>
+            </div>
+            {receiptScanMessage && <p className="stock-receipt-scan-message" role="status">{receiptScanMessage}</p>}
+            <small>Les codes déjà enregistrés sont refusés. Les codes StockWise seront générés seulement pour les pièces ajoutées sans code individuel.</small>
+            {receiptDraftItems.filter((item) => item.variantId === receiptVariantId).length > 0 && <div className="stock-receipt-draft-list"><strong>Pièces de cette variante</strong>{receiptDraftItems.filter((item) => item.variantId === receiptVariantId).map((item, index) => <div key={item.key}><span>{index + 1}. {item.barcode ?? "Code StockWise à générer"}</span><button type="button" className="secondary-button" onClick={() => setReceiptDraftItems((items) => items.filter((row) => row.key !== item.key))}>Retirer</button></div>)}</div>}
+            <div className="product-form-actions"><button className="secondary-button" type="button" onClick={() => { setReceiptStep(1); setError(""); }}>← Changer la variante</button><button className="primary-button" type="button" onClick={() => { const expected = receiptExpectedByVariant[receiptVariantId] ?? Number(receiptQuantity); const actual = receiptDraftItems.filter((item) => item.variantId === receiptVariantId).length; if (actual !== expected) { setError(`Il faut ajouter ${expected - actual} pièce(s) supplémentaire(s) pour cette variante.`); return; } setError(""); setReceiptStep(3); }}>Terminer cette variante →</button></div>
+          </div>}
+          {receiptStep === 3 && <div className="stock-receipt-wizard-panel">
+            <h3>3. Vérifie la réception</h3>
+            <p>Voici le résumé des variantes et des pièces que tu as ajoutées. Tu peux ajouter une autre variante avant de valider.</p>
+            <div className="stock-receipt-draft-list">{Object.entries(receiptExpectedByVariant).map(([id, expected]) => { const v = variants.find((variant) => variant.id === id); const actual = receiptDraftItems.filter((item) => item.variantId === id).length; return <div key={id}><span><strong>{v?.products?.name ?? "Produit"}{v?.size ? ` · ${v.size}` : ""}{v?.color ? ` · ${v.color}` : ""}</strong><small>{actual} / {expected} pièce(s) · {actual === expected ? "Complet" : "À compléter"}</small></span><button className="secondary-button" type="button" onClick={() => { setReceiptVariantId(id); setReceiptQuantity(String(expected)); setReceiptStep(2); setError(""); }}>Modifier</button></div>; })}</div>
+            <p><strong>Total : {receiptDraftItems.length} pièce(s)</strong> sur {Object.values(receiptExpectedByVariant).reduce((sum, count) => sum + count, 0)} attendue(s).</p>
+            <div className="product-form-actions"><button className="secondary-button" type="button" onClick={() => { setReceiptVariantId(""); setReceiptQuantity("1"); setReceiptBarcodes(""); setReceiptScanMessage(""); setError(""); setReceiptStep(1); }}>＋ Ajouter une autre variante</button><button className="primary-button" type="submit" disabled={receiptSaving || loading || !shop || receiptDraftItems.length === 0}>{receiptSaving ? "Réception en cours..." : "Valider la réception"}</button></div>
+          </div>}
+          <div className="product-form-actions"><button className="secondary-button" type="button" onClick={() => { setReceiptVariantId(""); setReceiptQuantity("1"); setReceiptBarcodes(""); setReceiptDraftItems([]); setReceiptExpectedByVariant({}); setReceiptStep(1); setReceiptReason("Réception fournisseur"); setReceiptScanMessage(""); setError(""); }}>Réinitialiser</button></div>
         </form>}
       </section>
 
       {receivedItems.length > 0 && <section className="product-form-card stock-received-labels">
-        <div className="product-form-heading"><div><h2>Pièces réceptionnées</h2><p>{receivedItems.length} code(s) individuel(s) créé(s). Tu peux conserver cette liste ou l’imprimer.</p></div><button className="secondary-button" type="button" onClick={() => window.print()}>Imprimer la liste</button></div>
+        <div className="product-form-heading"><div><h2>Pièces réceptionnées</h2><p>{receivedItems.length} pièce(s) réceptionnée(s). Tu peux conserver cette liste ou l’imprimer.</p></div><button className="secondary-button" type="button" onClick={() => window.print()}>Imprimer la liste</button></div>
         <div className="stock-received-label-grid" id="stockwise-received-labels">
           {receivedItems.map((item, index) => {
-            const labelVariant = variants.find((variant) => variant.id === receiptVariantId);
+            const labelVariant = variants.find((variant) => variant.id === (item as ReceivedItemRow & { _variantId?: string })._variantId) ?? variants.find((variant) => variant.id === receiptVariantId);
             return <article className="stock-received-label" key={item.item_id}>
               <span>{shop?.name ?? "STOCKWISE"} · {index + 1}/{receivedItems.length}</span>
               <strong>{labelVariant?.products?.name ?? "Article"}</strong>
@@ -2494,10 +2981,9 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
       </>}
 
       {activeStockTab === "operations" && <form className="product-form-card stock-movement-form" onSubmit={handleMovement}>
-        <div className="product-form-heading"><div><h2>Enregistrer un mouvement</h2><p>Le stock sera mis à jour automatiquement après validation.</p></div></div>
+        <div className="product-form-heading"><div><h2>Enregistrer une sortie de stock</h2><p>Utilise cette section uniquement pour les articles retirés du stock. Les nouveaux articles doivent passer par Réception.</p></div></div>
         <div className="stock-type-switch" role="group" aria-label="Type de mouvement">
-          <button type="button" className={movementType === "in" ? "stock-type-button stock-type-button-active stock-type-in" : "stock-type-button"} onClick={() => { setMovementType("in"); setMovementKind("purchase"); setError(""); }}>＋ Entrée de stock</button>
-          <button type="button" className={movementType === "out" ? "stock-type-button stock-type-button-active stock-type-out" : "stock-type-button"} onClick={() => { setMovementType("out"); setMovementKind("loss"); setError(""); }}>− Sortie de stock</button>
+          <button type="button" className="stock-type-button stock-type-button-active stock-type-out" aria-pressed="true">− Sortie de stock</button>
         </div>
         <div className="product-form-grid stock-movement-grid">
           <label>Produit / référence *
@@ -2505,28 +2991,19 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
               {variants.map((variant) => <option key={variant.id} value={variant.id}>{variant.products?.name ?? "Produit sans nom"}{variant.size ? ` · ${variant.size}` : ""}{variant.color ? ` · ${variant.color}` : ""} — {variant.sku} (stock : {variant.stock_quantity})</option>)}
             </select>
           </label>
-          <label>Type de mouvement *
+          <label>Motif de sortie *
             <select value={movementKind} onChange={(event) => setMovementKind(event.target.value as typeof movementKind)} required>
-              {movementType === "in" ? (
-                <>
-                  <option value="purchase">Réapprovisionnement</option>
-                  <option value="opening">Stock initial</option>
-                </>
-              ) : (
-                <>
-                  <option value="loss">Perte / article endommagé</option>
-                  <option value="supplier_return">Retour au fournisseur</option>
-                  <option value="adjustment">Correction d’inventaire (sortie)</option>
-                </>
-              )}
+              <option value="loss">Perte / article endommagé</option>
+              <option value="supplier_return">Retour au fournisseur</option>
+              <option value="adjustment">Correction d’inventaire (sortie)</option>
             </select>
           </label>
           <label>Quantité *<input type="number" min="1" step="1" inputMode="numeric" value={quantity} onChange={(event) => setQuantity(event.target.value)} required /></label>
-          <label>Note (facultatif)<input value={reason} onChange={(event) => setReason(event.target.value)} maxLength={250} placeholder={movementType === "in" ? (movementKind === "opening" ? "Ex. Stock de départ" : "Ex. Réapprovisionnement fournisseur") : (movementKind === "loss" ? "Ex. Article endommagé" : movementKind === "supplier_return" ? "Ex. Retour commande fournisseur" : "Ex. Écart constaté au comptage")} /></label>
+          <label>Note (facultatif)<input value={reason} onChange={(event) => setReason(event.target.value)} maxLength={250} placeholder={movementKind === "loss" ? "Ex. Article endommagé" : movementKind === "supplier_return" ? "Ex. Retour commande fournisseur" : "Ex. Écart constaté au comptage"} /></label>
         </div>
-        {selectedVariant && <p className="stock-selected-note">Stock actuel : <strong>{selectedVariant.stock_quantity}</strong> unité(s){movementType === "out" ? ` · Après sortie : ${Math.max(0, selectedVariant.stock_quantity - (Number(quantity) || 0))}` : ` · Après entrée : ${selectedVariant.stock_quantity + (Number(quantity) || 0)}`}</p>}
+        {selectedVariant && <p className="stock-selected-note">Stock actuel : <strong>{selectedVariant.stock_quantity}</strong> unité(s) · Après sortie : {Math.max(0, selectedVariant.stock_quantity - (Number(quantity) || 0))}</p>}
         {variants.length === 0 && !loading && <p className="stock-selected-note">Aucun produit actif disponible. Crée d’abord un produit dans le catalogue.</p>}
-        <div className="product-form-actions"><button className="secondary-button" type="button" onClick={() => { setVariantId(""); setQuantity("1"); setReason(""); setMovementType("in"); setMovementKind("purchase"); setError(""); }}>Réinitialiser</button><button className="primary-button" type="submit" disabled={saving || loading || !shop || variants.length === 0}>{saving ? "Enregistrement..." : "Enregistrer le mouvement"}</button></div>
+        <div className="product-form-actions"><button className="secondary-button" type="button" onClick={() => { setVariantId(""); setQuantity("1"); setReason(""); setMovementType("out"); setMovementKind("loss"); setError(""); }}>Réinitialiser</button><button className="primary-button" type="submit" disabled={saving || loading || !shop || variants.length === 0}>{saving ? "Enregistrement..." : "Enregistrer la sortie"}</button></div>
       </form>}
 
       {activeStockTab === "inventory" && <form className="product-form-card stock-count-form" onSubmit={handleInventoryCount}>
@@ -2555,8 +3032,20 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
       <div className="catalog-table-card">
         {loading ? <div className="catalog-empty"><span className="loading-spinner" /><p>Chargement du stock...</p></div> : filteredVariants.length === 0 ? <div className="catalog-empty"><h2>Aucune référence trouvée</h2><p>Crée un produit ou modifie ta recherche.</p></div> : (
           <div className="catalog-table-wrap"><table className="catalog-table"><thead><tr><th>Produit</th><th>Référence</th><th>Stock actuel</th><th>Seuil d’alerte</th><th>État</th></tr></thead><tbody>
-            {filteredVariants.map((variant) => { const low = variant.stock_quantity <= variant.low_stock_threshold; return <tr key={variant.id}><td><div className="catalog-product-name"><strong>{variant.products?.name ?? "Produit sans nom"}</strong><span>{[variant.size, variant.color].filter(Boolean).join(" · ") || "Aucune variante détaillée"}</span></div></td><td><code>{variant.sku}</code></td><td><span className={`stock-pill${variant.stock_quantity > 0 ? " stock-pill-in" : ""}`}>{variant.stock_quantity}</span></td><td>{variant.low_stock_threshold}</td><td><span className={`stock-status-pill${low ? " stock-status-low" : " stock-status-ok"}`}>{low ? "Stock bas" : "Disponible"}</span></td></tr>; })}
+            {paginatedVariants.map((variant) => { const low = variant.stock_quantity <= variant.low_stock_threshold; return <tr key={variant.id}><td><div className="catalog-product-name"><strong>{variant.products?.name ?? "Produit sans nom"}</strong><span>{[variant.size, variant.color].filter(Boolean).join(" · ") || "Aucune variante détaillée"}</span></div></td><td><code>{variant.sku}</code></td><td><span className={`stock-pill${variant.stock_quantity > 0 ? " stock-pill-in" : ""}`}>{variant.stock_quantity}</span></td><td>{variant.low_stock_threshold}</td><td><span className={`stock-status-pill${low ? " stock-status-low" : " stock-status-ok"}`}>{low ? "Stock bas" : "Disponible"}</span></td></tr>; })}
           </tbody></table></div>
+        )}
+        {!loading && filteredVariants.length > 0 && (
+          <div className="stock-history-pagination stock-products-pagination" aria-label="Pagination des références de stock">
+            <span>
+              Affichage de {(productPage - 1) * productPageSize + 1} à {Math.min(productPage * productPageSize, filteredVariants.length)} sur {filteredVariants.length} référence(s)
+            </span>
+            <div className="stock-history-pagination-actions">
+              <button type="button" className="secondary-button" onClick={() => setProductPage((page) => Math.max(1, page - 1))} disabled={productPage <= 1}>Précédent</button>
+              <span>Page {productPage} / {productPageCount}</span>
+              <button type="button" className="secondary-button" onClick={() => setProductPage((page) => Math.min(productPageCount, page + 1))} disabled={productPage >= productPageCount}>Suivant</button>
+            </div>
+          </div>
         )}
       </div>
 
@@ -2571,8 +3060,20 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
         <div className="catalog-table-card">
           {loading ? <div className="catalog-empty"><p>Chargement de l’historique...</p></div> : movements.length === 0 ? <div className="catalog-empty"><h2>Aucun mouvement pour le moment</h2><p>Les entrées et sorties apparaîtront ici après leur enregistrement.</p></div> : filteredMovements.length === 0 ? <div className="catalog-empty"><h2>Aucun résultat</h2><p>Modifie les critères ou efface les filtres pour revoir l’historique.</p></div> : (
             <div className="catalog-table-wrap"><table className="catalog-table"><thead><tr><th>Date</th><th>Produit</th><th>Type</th><th>Quantité</th><th>Motif</th></tr></thead><tbody>
-              {filteredMovements.map((movement) => { const variant = variantById.get(movement.variant_id); const isIn = movement.quantity_change > 0; return <tr key={movement.id}><td>{new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium", timeStyle: "short", timeZone: shop?.timezone || "Africa/Lubumbashi" }).format(new Date(movement.created_at))}</td><td><div className="catalog-product-name"><strong>{variant?.products?.name ?? "Produit"}</strong><span>{variant?.sku ?? "Référence indisponible"}</span></div></td><td><span className={`stock-status-pill ${isIn ? "stock-status-ok" : "stock-status-out"}`}>{movementLabels[movement.movement_type] ?? (isIn ? "Entrée" : "Sortie")}</span></td><td className={isIn ? "stock-quantity-positive" : "stock-quantity-negative"}>{isIn ? "+" : ""}{movement.quantity_change}</td><td>{movement.reason || "—"}</td></tr>; })}
+              {paginatedMovements.map((movement) => { const variant = variantById.get(movement.variant_id); const isIn = movement.quantity_change > 0; return <tr key={movement.id}><td>{new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium", timeStyle: "short", timeZone: shop?.timezone || "Africa/Lubumbashi" }).format(new Date(movement.created_at))}</td><td><div className="catalog-product-name"><strong>{variant?.products?.name ?? "Produit"}</strong><span>{variant?.sku ?? "Référence indisponible"}</span></div></td><td><span className={`stock-status-pill ${isIn ? "stock-status-ok" : "stock-status-out"}`}>{movementLabels[movement.movement_type] ?? (isIn ? "Entrée" : "Sortie")}</span></td><td className={isIn ? "stock-quantity-positive" : "stock-quantity-negative"}>{isIn ? "+" : ""}{movement.quantity_change}</td><td>{movement.reason || "—"}</td></tr>; })}
             </tbody></table></div>
+          )}
+          {!loading && filteredMovements.length > 0 && (
+            <div className="stock-history-pagination" aria-label="Pagination de l’historique">
+              <span>
+                Affichage de {(historyPage - 1) * historyPageSize + 1} à {Math.min(historyPage * historyPageSize, filteredMovements.length)} sur {filteredMovements.length} mouvement(s)
+              </span>
+              <div className="stock-history-pagination-actions">
+                <button type="button" className="secondary-button" onClick={() => setHistoryPage((page) => Math.max(1, page - 1))} disabled={historyPage <= 1}>Précédent</button>
+                <span>Page {historyPage} / {historyPageCount}</span>
+                <button type="button" className="secondary-button" onClick={() => setHistoryPage((page) => Math.min(historyPageCount, page + 1))} disabled={historyPage >= historyPageCount}>Suivant</button>
+              </div>
+            </div>
           )}
         </div>
       </div>

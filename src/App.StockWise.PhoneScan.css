@@ -1,0 +1,16 @@
+/* Connexion temporaire du téléphone au PC StockWise */
+.phone-scan-connector { margin: 18px 0; border: 1px solid #cfe4d7; }
+.phone-scan-connector .product-form-heading h2 { display:flex; align-items:center; gap:8px; }
+.phone-scan-code { display:flex; flex-direction:column; align-items:flex-start; gap:4px; margin:14px 0; padding:16px; border-radius:12px; background:#f0faf4; border:1px solid #cfe4d7; }
+.phone-scan-code span,.phone-scan-code small { color:#52705e; font-size:12px; }
+.phone-scan-code strong { font-size:clamp(28px,5vw,38px); letter-spacing:.16em; color:#126b45; font-variant-numeric:tabular-nums; }
+.phone-scan-instructions { overflow-wrap:anywhere; color:#52635a; font-size:14px; }
+.phone-scan-page { min-height:100vh; display:grid; place-items:center; padding:20px; background:#f3f7f4; }
+.phone-scan-mobile-card { width:min(100%,520px); padding:clamp(18px,4vw,30px); }
+.phone-scan-mobile-card h1 { margin:10px 0; }
+.phone-scan-mobile-card > p { line-height:1.55; }
+.phone-scan-mobile-card form { display:grid; gap:10px; margin-top:20px; }
+.phone-scan-mobile-card form label { font-weight:600; }
+.phone-scan-mobile-card form input { width:100%; min-width:0; box-sizing:border-box; padding:12px; border:1px solid #cbd5ce; border-radius:9px; font:inherit; }
+.phone-scan-mobile-card .stock-scan-video-wrap { margin-top:18px; }
+@media(max-width:480px) { .phone-scan-page { padding:10px; align-items:start; } .phone-scan-mobile-card { padding:16px; } .phone-scan-code strong { letter-spacing:.1em; } }
