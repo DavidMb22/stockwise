@@ -752,6 +752,7 @@ type ProductRow = {
   name: string;
   brand: string | null;
   description?: string | null;
+  image_url?: string | null;
   category_id: string | null;
   is_active: boolean;
   product_variants?: {
@@ -770,6 +771,54 @@ type ProductRow = {
 
 type CategoryRow = { id: string; name: string };
 
+type ProductCategoryKind = "clothing" | "shoes" | "general";
+
+function getProductCategoryKind(categoryName: string | undefined | null): ProductCategoryKind {
+  const normalized = (categoryName ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("fr")
+    .replace(/[’']/g, " ");
+
+  if (/chauss|sneaker|basket|soulier|botte|sandale|escarpin/.test(normalized)) return "shoes";
+  if (/vetement|t shirt|t-shirt|tshirt|chemise|pantalon|robe|jupe|pull|veste|jean|textile|lingerie|mode/.test(normalized)) return "clothing";
+  return "general";
+}
+
+type ProductImageUpload = { url: string; path: string };
+
+const PRODUCT_IMAGE_BUCKET = "stockwise-product-images";
+const MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024;
+
+async function uploadProductImage(
+  shopId: string,
+  productId: string,
+  file: File,
+): Promise<ProductImageUpload> {
+  const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
+  if (!allowedTypes.includes(file.type)) {
+    throw new Error("Choisis une image JPG, PNG ou WebP.");
+  }
+  if (file.size > MAX_PRODUCT_IMAGE_BYTES) {
+    throw new Error("L’image ne doit pas dépasser 5 Mo.");
+  }
+
+  const extension = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
+  const path = `${shopId}/${productId}/${crypto.randomUUID()}.${extension}`;
+  const { error: uploadError } = await supabase.storage
+    .from(PRODUCT_IMAGE_BUCKET)
+    .upload(path, file, {
+      cacheControl: "3600",
+      contentType: file.type,
+      upsert: false,
+    });
+  if (uploadError) throw new Error(`Impossible d’enregistrer la photo : ${uploadError.message}`);
+
+  const { data } = supabase.storage.from(PRODUCT_IMAGE_BUCKET).getPublicUrl(path);
+  if (!data.publicUrl) throw new Error("La photo a été téléversée, mais son URL est indisponible.");
+  return { url: data.publicUrl, path };
+}
+
 function ProductsModule({ shop }: { shop: Shop | null }) {
   const [products, setProducts] = useState<ProductRow[]>([]);
   const [categories, setCategories] = useState<CategoryRow[]>([]);
@@ -786,6 +835,9 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
   const [editProductName, setEditProductName] = useState("");
   const [editProductBrand, setEditProductBrand] = useState("");
   const [editProductDescription, setEditProductDescription] = useState("");
+  const [editProductImage, setEditProductImage] = useState<File | null>(null);
+  const [editProductImagePreview, setEditProductImagePreview] = useState("");
+  const [removeEditProductImage, setRemoveEditProductImage] = useState(false);
   const [editProductCategoryId, setEditProductCategoryId] = useState("");
   const [updatingProduct, setUpdatingProduct] = useState(false);
   const [search, setSearch] = useState("");
@@ -795,6 +847,8 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
   const [brand, setBrand] = useState("");
   const [categoryId, setCategoryId] = useState("");
   const [description, setDescription] = useState("");
+  const [productImage, setProductImage] = useState<File | null>(null);
+  const [productImagePreview, setProductImagePreview] = useState("");
   const [size, setSize] = useState("");
   const [color, setColor] = useState("");
   const [barcode, setBarcode] = useState("");
@@ -824,6 +878,13 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
   const [showArchivedProducts, setShowArchivedProducts] = useState(false);
   const [productActionId, setProductActionId] = useState<string | null>(null);
 
+  const selectedCategoryKind = getProductCategoryKind(categories.find((category) => category.id === categoryId)?.name);
+  const addedVariantCategoryKind = getProductCategoryKind(categories.find((category) => category.id === addingVariantTo?.category_id)?.name);
+  const editedVariantCategoryKind = getProductCategoryKind(categories.find((category) => category.id === editingVariant?.product.category_id)?.name);
+  const initialVariantDimensionLabel = selectedCategoryKind === "shoes" ? "Pointure" : "Taille";
+  const addedVariantDimensionLabel = addedVariantCategoryKind === "shoes" ? "Pointure" : "Taille";
+  const editedVariantDimensionLabel = editedVariantCategoryKind === "shoes" ? "Pointure" : "Taille";
+
   async function loadCatalog() {
     if (!shop) {
       setLoading(false);
@@ -835,7 +896,7 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
       supabase
         .from("products")
         .select(
-          "id, name, brand, description, category_id, is_active, product_variants(id, sku, barcode, size, color, purchase_price, selling_price, stock_quantity, low_stock_threshold, is_active)",
+          "id, name, brand, description, image_url, category_id, is_active, product_variants(id, sku, barcode, size, color, purchase_price, selling_price, stock_quantity, low_stock_threshold, is_active)",
         )
         .eq("shop_id", shop.id)
         .order("created_at", { ascending: false }),
@@ -912,6 +973,9 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
     setEditProductName(product.name);
     setEditProductBrand(product.brand ?? "");
     setEditProductDescription(product.description ?? "");
+    setEditProductImage(null);
+    setEditProductImagePreview(product.image_url ?? "");
+    setRemoveEditProductImage(false);
     setEditProductCategoryId(product.category_id ?? "");
     setFormError("");
     setFeedback("");
@@ -925,6 +989,9 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
     setEditProductName("");
     setEditProductBrand("");
     setEditProductDescription("");
+    setEditProductImage(null);
+    setEditProductImagePreview("");
+    setRemoveEditProductImage(false);
     setEditProductCategoryId("");
     setFormError("");
   }
@@ -944,6 +1011,11 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
     setFormError("");
     setFeedback("");
     try {
+      let imageUrl = removeEditProductImage ? null : (editingProductDetails.image_url ?? null);
+      if (editProductImage) {
+        const uploaded = await uploadProductImage(shop.id, editingProductDetails.id, editProductImage);
+        imageUrl = uploaded.url;
+      }
       const { error } = await supabase
         .from("products")
         .update({
@@ -951,13 +1023,14 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
           brand: editProductBrand.trim() || null,
           description: editProductDescription.trim() || null,
           category_id: editProductCategoryId || null,
+          image_url: imageUrl,
         })
         .eq("id", editingProductDetails.id)
         .eq("shop_id", shop.id);
       if (error) throw new Error(error.message);
       const productId = editingProductDetails.id;
       setProducts((previous) => previous.map((product) => product.id === productId
-        ? { ...product, name: cleanName, brand: editProductBrand.trim() || null, description: editProductDescription.trim() || null, category_id: editProductCategoryId || null }
+        ? { ...product, name: cleanName, brand: editProductBrand.trim() || null, description: editProductDescription.trim() || null, category_id: editProductCategoryId || null, image_url: imageUrl }
         : product));
       setFeedback(`Les informations du produit « ${cleanName} » ont été mises à jour. Les références et le stock sont inchangés.`);
       cancelEditingProductDetails();
@@ -1011,6 +1084,8 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
     setBrand("");
     setCategoryId("");
     setDescription("");
+    setProductImage(null);
+    setProductImagePreview("");
     setSize("");
     setColor("");
     setBarcode("");
@@ -1056,6 +1131,7 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
           brand: brand.trim() || null,
           category_id: categoryId || null,
           description: description.trim() || null,
+          image_url: null,
           is_active: true,
         })
         .select("id")
@@ -1064,6 +1140,25 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
         throw new Error(
           productError?.message || "Le produit n’a pas pu être créé.",
         );
+
+      if (productImage) {
+        try {
+          const uploaded = await uploadProductImage(shop.id, product.id, productImage);
+          const { error: imageUpdateError } = await supabase
+            .from("products")
+            .update({ image_url: uploaded.url })
+            .eq("id", product.id)
+            .eq("shop_id", shop.id);
+          if (imageUpdateError) {
+            await supabase.storage.from(PRODUCT_IMAGE_BUCKET).remove([uploaded.path]);
+            throw new Error(imageUpdateError.message);
+          }
+        } catch (imageError) {
+          // Avoid leaving a half-created product if its optional image cannot be saved.
+          await supabase.from("products").delete().eq("id", product.id).eq("shop_id", shop.id);
+          throw new Error(`La photo n’a pas pu être enregistrée. Le produit n’a pas été conservé : ${imageError instanceof Error ? imageError.message : "erreur inconnue"}`);
+        }
+      }
 
       // Create one initial variant; stock always starts at zero and is recorded later through stock movements.
       const sku = `SW-${crypto.randomUUID().replaceAll("-", "").slice(0, 10).toUpperCase()}`;
@@ -1414,7 +1509,8 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
           <div className="category-manager-heading"><div><span className="section-eyebrow">ORGANISATION DU CATALOGUE</span><h2>Gérer les catégories</h2><p>Crée les catégories utilisées pour classer tes produits.</p></div><span className="category-manager-count">{categories.length} catégorie(s)</span></div>
           <form className="category-create-form" onSubmit={handleCreateCategory}>
             <label htmlFor="new-category-name">Nom de la catégorie</label>
-            <div className="category-create-controls"><input id="new-category-name" value={categoryName} onChange={(event) => setCategoryName(event.target.value)} placeholder="Ex. T-shirts, Chaussures, Accessoires" maxLength={80} required /><button className="primary-button" type="submit" disabled={categorySaving || !shop}>{categorySaving ? "Création..." : "＋ Créer la catégorie"}</button></div>
+            <div className="category-create-controls"><input id="new-category-name" value={categoryName} onChange={(event) => setCategoryName(event.target.value)} placeholder="Ex. Vêtements, Chaussures, Jouets" maxLength={80} required /><button className="primary-button" type="submit" disabled={categorySaving || !shop}>{categorySaving ? "Création..." : "＋ Créer la catégorie"}</button></div>
+          <div className="category-suggestions" aria-label="Suggestions de catégories">{["Vêtements", "Chaussures", "Jouets", "Accessoires", "Autres"].map((suggestion) => <button key={suggestion} type="button" className="category-suggestion" onClick={() => setCategoryName(suggestion)}>{suggestion}</button>)}</div>
           </form>
           {categories.length === 0 ? <div className="category-manager-empty">Aucune catégorie pour le moment. Crée ta première catégorie ci-dessus.</div> : <div className="category-chip-list">{categories.map((category) => { const used = products.filter((product) => product.category_id === category.id).length; return <div className="category-chip-row" key={category.id}><div className="category-chip-icon" aria-hidden="true">#</div><div className="category-chip-copy"><strong>{category.name}</strong><span>{used} produit{used === 1 ? "" : "s"} associé{used === 1 ? "" : "s"}</span></div><button className="category-delete-button" type="button" onClick={() => void handleDeleteCategory(category)} disabled={used > 0} title={used > 0 ? "Cette catégorie est utilisée par un produit" : "Supprimer la catégorie"}>Supprimer</button></div>; })}</div>}
         </section>
@@ -1455,7 +1551,7 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
               Catégorie
               <select
                 value={categoryId}
-                onChange={(e) => setCategoryId(e.target.value)}
+                onChange={(e) => { setCategoryId(e.target.value); setSize(""); setColor(""); }}
               >
                 <option value="">Sans catégorie</option>
                 {categories.map((category) => (
@@ -1475,32 +1571,51 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
                 maxLength={1000}
               />
             </label>
+            <div className="product-image-field">
+              <label htmlFor="new-product-image">Photo du produit (facultative)</label>
+              <input id="new-product-image" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => {
+                const file = event.target.files?.[0] ?? null;
+                setProductImage(file);
+                setProductImagePreview(file ? URL.createObjectURL(file) : "");
+                setFormError("");
+              }} />
+              <small>JPG, PNG ou WebP · 5 Mo maximum. Sur téléphone, tu peux prendre une photo ou choisir dans la galerie.</small>
+              {productImagePreview && <div className="product-image-preview"><img src={productImagePreview} alt="Aperçu de la photo du produit" /><button type="button" className="secondary-button" onClick={() => { setProductImage(null); setProductImagePreview(""); const input = document.getElementById("new-product-image") as HTMLInputElement | null; if (input) input.value = ""; }}>Retirer la photo</button></div>}
+            </div>
           </div>
           <div className="variant-form-heading">
             <h3>Première variante</h3>
             <p>
-              Chaque taille ou couleur supplémentaire aura sa propre référence.
+              {selectedCategoryKind === "shoes"
+                ? "La pointure et la couleur sont facultatives. Chaque variante possède sa propre référence."
+                : selectedCategoryKind === "clothing"
+                  ? "La taille et la couleur sont facultatives. Chaque variante possède sa propre référence."
+                  : "Les articles simples n’ont pas besoin de taille ni de couleur. Le stock sera enregistré séparément."}
             </p>
           </div>
           <div className="product-form-grid product-variant-grid">
-            <label>
-              Taille
-              <input
-                value={size}
-                onChange={(e) => setSize(e.target.value)}
-                placeholder="Ex. M"
-                maxLength={40}
-              />
-            </label>
-            <label>
-              Couleur
-              <input
-                value={color}
-                onChange={(e) => setColor(e.target.value)}
-                placeholder="Ex. Blanc"
-                maxLength={60}
-              />
-            </label>
+            {selectedCategoryKind !== "general" && (
+              <>
+                <label>
+                  {initialVariantDimensionLabel}
+                  <input
+                    value={size}
+                    onChange={(e) => setSize(e.target.value)}
+                    placeholder={selectedCategoryKind === "shoes" ? "Ex. 38, 39, 40" : "Ex. S, M, L"}
+                    maxLength={40}
+                  />
+                </label>
+                <label>
+                  Couleur (facultatif)
+                  <input
+                    value={color}
+                    onChange={(e) => setColor(e.target.value)}
+                    placeholder="Ex. Blanc"
+                    maxLength={60}
+                  />
+                </label>
+              </>
+            )}
             <label>
               Code-barres (facultatif)
               <input
@@ -1611,12 +1726,14 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
       {addingVariantTo && (
         <form className="product-form-card add-variant-card" onSubmit={handleAddVariant}>
           <div className="product-form-heading">
-            <div><span className="section-eyebrow">VARIANTE DU PRODUIT</span><h2>Ajouter une variante</h2><p>Produit parent : <strong>{addingVariantTo.name}</strong>. Une nouvelle référence sera générée, sans créer un autre produit.</p></div>
+            <div><span className="section-eyebrow">VARIANTE DU PRODUIT</span><h2>Ajouter une variante</h2><p>Produit parent : <strong>{addingVariantTo.name}</strong>. {addedVariantCategoryKind === "shoes" ? "La pointure et la couleur sont facultatives." : addedVariantCategoryKind === "clothing" ? "La taille et la couleur sont facultatives." : "Cette variante peut rester standard, sans taille ni couleur."} Une nouvelle référence sera générée.</p></div>
             <button className="secondary-button" type="button" onClick={resetVariantForm}>Fermer</button>
           </div>
           <div className="product-form-grid product-variant-grid">
-            <label>Taille<input value={variantSize} onChange={(e) => setVariantSize(e.target.value)} placeholder="Ex. M" maxLength={40} /></label>
-            <label>Couleur<input value={variantColor} onChange={(e) => setVariantColor(e.target.value)} placeholder="Ex. Blanc" maxLength={60} /></label>
+            {addedVariantCategoryKind !== "general" && <>
+              <label>{addedVariantDimensionLabel}<input value={variantSize} onChange={(e) => setVariantSize(e.target.value)} placeholder={addedVariantCategoryKind === "shoes" ? "Ex. 38, 39, 40" : "Ex. S, M, L"} maxLength={40} /></label>
+              <label>Couleur (facultatif)<input value={variantColor} onChange={(e) => setVariantColor(e.target.value)} placeholder="Ex. Blanc" maxLength={60} /></label>
+            </>}
             <label>Code-barres (facultatif)<input value={variantBarcode} onChange={(e) => setVariantBarcode(e.target.value)} placeholder="Scanner ou saisir le code" maxLength={120} autoComplete="off" /></label>
             <label>Prix d’achat ({shop?.currency_code ?? "CDF"}) *<input type="number" min="0" step="any" value={variantPurchasePrice} onChange={(e) => setVariantPurchasePrice(e.target.value)} required placeholder="0" /></label>
             <label>Prix de vente ({shop?.currency_code ?? "CDF"}) *<input type="number" min="0" step="any" value={variantSellingPrice} onChange={(e) => setVariantSellingPrice(e.target.value)} required placeholder="0" /></label>
@@ -1639,8 +1756,10 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
             <button className="secondary-button" type="button" onClick={resetEditingVariant}>Fermer</button>
           </div>
           <div className="product-form-grid product-variant-grid">
-            <label>Taille<input value={editVariantSize} onChange={(e) => setEditVariantSize(e.target.value)} placeholder="Ex. M" maxLength={40} /></label>
-            <label>Couleur<input value={editVariantColor} onChange={(e) => setEditVariantColor(e.target.value)} placeholder="Ex. Blanc" maxLength={60} /></label>
+            {editedVariantCategoryKind !== "general" && <>
+              <label>{editedVariantDimensionLabel}<input value={editVariantSize} onChange={(e) => setEditVariantSize(e.target.value)} placeholder={editedVariantCategoryKind === "shoes" ? "Ex. 38, 39, 40" : "Ex. S, M, L"} maxLength={40} /></label>
+              <label>Couleur (facultatif)<input value={editVariantColor} onChange={(e) => setEditVariantColor(e.target.value)} placeholder="Ex. Blanc" maxLength={60} /></label>
+            </>}
             <label>Code-barres (facultatif)<input value={editVariantBarcode} onChange={(e) => setEditVariantBarcode(e.target.value)} placeholder="Scanner ou saisir le code" maxLength={120} autoComplete="off" /></label>
             <label>Prix d’achat ({shop?.currency_code ?? "CDF"}) *<input type="number" min="0" step="any" value={editVariantPurchasePrice} onChange={(e) => setEditVariantPurchasePrice(e.target.value)} required /></label>
             <label>Prix de vente ({shop?.currency_code ?? "CDF"}) *<input type="number" min="0" step="any" value={editVariantSellingPrice} onChange={(e) => setEditVariantSellingPrice(e.target.value)} required /></label>
@@ -1670,6 +1789,19 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
             <label>Marque<input value={editProductBrand} onChange={(event) => setEditProductBrand(event.target.value)} maxLength={100} placeholder="Ex. Nike" /></label>
             <label>Catégorie<select value={editProductCategoryId} onChange={(event) => setEditProductCategoryId(event.target.value)}><option value="">Sans catégorie</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label>
             <label className="product-details-description">Description<textarea value={editProductDescription} onChange={(event) => setEditProductDescription(event.target.value)} rows={3} maxLength={2000} placeholder="Détails utiles sur le produit" /></label>
+            <div className="product-image-field product-image-field-edit">
+              <label htmlFor="edit-product-image">Photo du produit (facultative)</label>
+              <input id="edit-product-image" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => {
+                const file = event.target.files?.[0] ?? null;
+                setEditProductImage(file);
+                setEditProductImagePreview(file ? URL.createObjectURL(file) : (editingProductDetails.image_url ?? ""));
+                setRemoveEditProductImage(false);
+                setFormError("");
+              }} />
+              <small>JPG, PNG ou WebP · 5 Mo maximum.</small>
+              {editProductImagePreview && <div className="product-image-preview"><img src={editProductImagePreview} alt="Aperçu de la photo du produit" /><button type="button" className="secondary-button" onClick={() => { setEditProductImage(null); setEditProductImagePreview(""); setRemoveEditProductImage(true); const input = document.getElementById("edit-product-image") as HTMLInputElement | null; if (input) input.value = ""; }}>Supprimer la photo</button></div>}
+              {!editProductImagePreview && editingProductDetails.image_url && <small>La photo actuelle sera supprimée à l’enregistrement.</small>}
+            </div>
           </div>
           {formError && <p className="catalog-error" role="alert">{formError}</p>}
           <div className="product-form-actions">
@@ -1754,8 +1886,11 @@ function ProductsModule({ shop }: { shop: Shop | null }) {
                       <tr className="catalog-parent-row">
                         <td>
                           <div className="catalog-product-name">
-                            <strong>{product.name}</strong>
-                            <span>{[product.brand, `${variants.length} variante${variants.length === 1 ? "" : "s"}`].filter(Boolean).join(" · ")}</span>
+                            {product.image_url ? <img className="catalog-product-thumb" src={product.image_url} alt="" loading="lazy" /> : <span className="catalog-product-thumb catalog-product-thumb-placeholder" aria-hidden="true">▧</span>}
+                            <div>
+                              <strong>{product.name}</strong>
+                              <span>{[product.brand, `${variants.length} variante${variants.length === 1 ? "" : "s"}`].filter(Boolean).join(" · ")}</span>
+                            </div>
                           </div>
                         </td>
                         <td>{category}</td>
@@ -1923,7 +2058,7 @@ function ScannerModule({ shop }: { shop: Shop | null }) {
   return (
     <section className="catalog-page stock-scan-page">
       <div className="catalog-heading">
-        <div><span className="section-eyebrow">LECTURE PAR CAMÉRA</span><h1>Scanner un vêtement</h1><p>Utilise la caméra de ton téléphone pour retrouver une pièce par son code-barres.</p></div>
+        <div><span className="section-eyebrow">LECTURE PAR CAMÉRA</span><h1>Scanner un article</h1><p>Utilise la caméra de ton téléphone pour retrouver un article par son code-barres.</p></div>
       </div>
       {!shop && <p className="catalog-error" role="alert">La boutique n’est pas disponible.</p>}
       {error && <p className="catalog-error" role="alert">{error}</p>}
@@ -2007,6 +2142,58 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
     receiptScannerControlsRef.current = null;
   }, []);
 
+  async function handleReceiptScannedCode(codeValue: string) {
+    const code = codeValue.trim();
+    if (!code || !shop) return;
+    setError("");
+    setReceiptScanMessage("");
+    try {
+      // First, prevent receiving the same individually registered piece twice.
+      const { data: existingItem, error: itemLookupError } = await supabase
+        .from("variant_items")
+        .select("id, barcode, status, product_variants(sku, size, color, products(name))")
+        .eq("shop_id", shop.id)
+        .eq("barcode", code)
+        .maybeSingle();
+      if (itemLookupError) throw new Error(itemLookupError.message);
+      if (existingItem) {
+        const details = existingItem as unknown as {
+          barcode: string; status: string;
+          product_variants?: { sku?: string; size?: string | null; color?: string | null; products?: { name?: string } | null } | null;
+        };
+        setReceiptScanMessage(`Ce code est déjà enregistré pour « ${details.product_variants?.products?.name ?? "un article"} » (${details.status}). Aucune nouvelle pièce n’a été ajoutée.`);
+        return;
+      }
+
+      // A variant-level barcode identifies the model/variant, not a unique physical piece.
+      // Select that variant, but let the receive function generate individual StockWise codes.
+      const { data: matchingVariant, error: variantLookupError } = await supabase
+        .from("product_variants")
+        .select("id, sku, size, color, barcode, products(name)")
+        .eq("shop_id", shop.id)
+        .eq("barcode", code)
+        .eq("is_active", true)
+        .maybeSingle();
+      if (variantLookupError) throw new Error(variantLookupError.message);
+      if (matchingVariant) {
+        const match = matchingVariant as unknown as { id: string; sku: string; size: string | null; color: string | null; products?: { name: string } | null };
+        setReceiptVariantId(match.id);
+        setReceiptScanMessage(`Variante retrouvée : « ${match.products?.name ?? "Produit"} »${match.size ? ` · ${match.size}` : ""}${match.color ? ` · ${match.color}` : ""}. Le code du modèle n’est pas ajouté comme code individuel : StockWise générera un code unique pour chaque pièce reçue.`);
+        return;
+      }
+
+      // Unknown supplier code: keep it ready, then let the user choose the matching
+      // existing variant in the form. No product or database record is created by scanning.
+      setReceiptBarcodes((current) => {
+        const codes = current.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+        return codes.includes(code) ? current : (current.trim() ? `${current.trim()}\n${code}` : code);
+      });
+      setReceiptScanMessage(`Code inconnu dans StockWise : ${code}. Choisis la variante existante dans « Produit / taille / couleur ». Si c’est un nouveau produit, crée-le d’abord dans Produits, puis reviens ici pour la réception.`);
+    } catch (lookupError) {
+      setError(`Recherche du code impossible : ${lookupError instanceof Error ? lookupError.message : "erreur inconnue"}`);
+    }
+  }
+
   async function startReceiptCamera() {
     setError("");
     setReceiptScanMessage("");
@@ -2025,8 +2212,7 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
         try { receiptScannerControlsRef.current?.stop(); } catch { /* no-op */ }
         receiptScannerControlsRef.current = null;
         setReceiptScanning(false);
-        setReceiptBarcodes((current) => current.trim() ? `${current.trim()}\n${code}` : code);
-        setReceiptScanMessage(`Code lu : ${code}. Tu peux scanner la pièce suivante.`);
+        void handleReceiptScannedCode(code);
       });
       receiptScannerControlsRef.current = controls;
       if (!receiptVideoRef.current || !receiptVideoRef.current.isConnected) {
@@ -2127,7 +2313,7 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
         p_shop_id: shop.id,
         p_variant_id: receiptVariantId,
         p_items: items,
-        p_reason: receiptReason.trim() || "Réception de vêtements",
+        p_reason: receiptReason.trim() || "Réception de marchandises",
       });
       if (rpcError) throw new Error(`Réception non enregistrée : ${rpcError.message}`);
       const result = (data ?? []) as ReceivedItemRow[];
@@ -2246,8 +2432,8 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
         <div className="product-form-heading">
           <div>
             <span className="section-eyebrow">NOUVELLE FONCTIONNALITÉ</span>
-            <h2>Réceptionner des vêtements</h2>
-            <p>Une fiche et un code-barres individuel seront créés pour chaque pièce reçue.</p>
+            <h2>Réceptionner des articles</h2>
+            <p>Une fiche de stock et un code-barres individuel seront créés pour chaque article reçu.</p>
           </div>
           <button className="secondary-button" type="button" onClick={() => setShowReceiptForm((value) => !value)}>
             {showReceiptForm ? "Réduire" : "Nouvelle réception"}
@@ -2269,15 +2455,15 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
             </label>
             <label className="stock-receipt-codes">Codes-barres fournisseur (facultatif)
               <textarea value={receiptBarcodes} onChange={(event) => { setReceiptBarcodes(event.target.value); setReceiptScanMessage(""); }} rows={4} autoComplete="off" placeholder={"Un code par ligne. Tu peux les saisir ou utiliser la caméra du téléphone.\nEx. 3601234567890"} />
-              <small>Scanne uniquement les codes individuels connus. Les lignes manquantes, les codes répétés et les codes déjà utilisés recevront un code StockWise unique.</small>
+              <small>À chaque scan, StockWise vérifie d’abord si le code correspond à une pièce déjà enregistrée ou à une variante existante. Les codes de modèle partagés ne sont pas réutilisés comme codes individuels ; StockWise génère alors des codes uniques par pièce.</small>
             </label>
             <div className="stock-receipt-phone-scanner">
               <div className="stock-receipt-scanner-actions">
                 {!receiptScanning ? <button className="secondary-button" type="button" onClick={() => void startReceiptCamera()} disabled={!shop || receiptSaving}><Icon name="scan" size={17} /> Scanner avec mon téléphone</button> : <button className="secondary-button" type="button" onClick={stopReceiptCamera}>Arrêter le scanner</button>}
                 {receiptScanMessage && <span className="stock-receipt-scan-message" role="status">{receiptScanMessage}</span>}
               </div>
-              <div className="stock-receipt-camera-wrap" style={{ display: receiptScanning ? "block" : "none" }}><div className="stock-receipt-camera-preview"><video ref={receiptVideoRef} className="stock-scan-video" muted playsInline aria-label="Caméra pour scanner le code fournisseur" /><div className="stock-scan-frame" aria-hidden="true" /></div><p>Cadre un seul code-barres à la fois. La caméra s’arrêtera après chaque lecture.</p></div>
-              <small>La caméra nécessite une connexion HTTPS et l’autorisation du navigateur. Après chaque lecture, appuie de nouveau sur le bouton pour scanner la pièce suivante.</small>
+              <div className="stock-receipt-camera-wrap" style={{ display: receiptScanning ? "block" : "none" }}><div className="stock-receipt-camera-preview"><video ref={receiptVideoRef} className="stock-scan-video" muted playsInline aria-label="Caméra pour scanner le code fournisseur" /><div className="stock-scan-frame" aria-hidden="true" /></div><p>Cadre un seul code-barres à la fois. Après la lecture, le code sera traité automatiquement.</p></div>
+              <small>La caméra nécessite une connexion HTTPS et l’autorisation du navigateur. Le code lu est ajouté automatiquement au champ si c’est un code fournisseur inconnu. Pour scanner un autre article, relance le scanner.</small>
             </div>
           </div>
           <div className="product-form-actions">
@@ -2294,7 +2480,7 @@ function StockModule({ shop, user }: { shop: Shop | null; user: User }) {
             const labelVariant = variants.find((variant) => variant.id === receiptVariantId);
             return <article className="stock-received-label" key={item.item_id}>
               <span>{shop?.name ?? "STOCKWISE"} · {index + 1}/{receivedItems.length}</span>
-              <strong>{labelVariant?.products?.name ?? "Vêtement"}</strong>
+              <strong>{labelVariant?.products?.name ?? "Article"}</strong>
               <div className="stock-label-variant">{labelVariant?.size && <span>Taille : {labelVariant.size}</span>}{labelVariant?.color && <span>Couleur : {labelVariant.color}</span>}</div>
               <BarcodeGraphic value={item.barcode} />
               <code>{item.barcode}</code>
