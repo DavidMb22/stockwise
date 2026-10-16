@@ -8,6 +8,7 @@ import "./App.StockWise.Grouped.css";
 import "./App.StockWise.Stock.css";
 import "./App.StockWise.Sales.css";
 import "./App.StockWise.PhoneScan.css";
+import "./App.StockWise.Admin.css";
 
 function BarcodeGraphic({ value }: { value: string }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -160,10 +161,419 @@ function PhoneScanPage() {
   </section></main>;
 }
 
+
+type AdminCreatedShop = {
+  id: string;
+  name: string;
+  owner_id: string;
+  address: string | null;
+  currency_code: string;
+  timezone: string;
+};
+
+type AdminShopRow = AdminCreatedShop & {
+  owner_email: string | null;
+  created_at: string | null;
+};
+
+function SuperAdminModule({ view = "shops" }: { view?: "shops" | "create" }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [address, setAddress] = useState("");
+  const [currencyCode, setCurrencyCode] = useState("CDF");
+  const [timezone, setTimezone] = useState("Africa/Lubumbashi");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [feedback, setFeedback] = useState("");
+  const [createdShop, setCreatedShop] = useState<AdminCreatedShop | null>(null);
+  const [shops, setShops] = useState<AdminShopRow[]>([]);
+  const [shopsLoading, setShopsLoading] = useState(true);
+  const [shopsError, setShopsError] = useState("");
+  const [shopSearch, setShopSearch] = useState("");
+  const [selectedShop, setSelectedShop] = useState<AdminShopRow | null>(null);
+
+  async function loadShops() {
+    setShopsLoading(true);
+    setShopsError("");
+    try {
+      const { data, error: functionError } = await supabase.functions.invoke(
+        "create-shop-for-owner",
+        { body: { action: "list-shops" } },
+      );
+      if (functionError) {
+        let message = functionError.message || "Impossible de charger les boutiques.";
+        try {
+          const response = (functionError as { context?: Response }).context;
+          if (response) {
+            const details = await response.clone().json() as { error?: string; message?: string };
+            message = details.error || details.message || message;
+          }
+        } catch { /* message Supabase conservé */ }
+        throw new Error(message);
+      }
+      if (!data?.success || !Array.isArray(data.shops)) {
+        throw new Error(data?.error || "Réponse invalide lors du chargement des boutiques.");
+      }
+      const { data: authData, error: authError } =
+        await supabase.auth.getUser();
+
+      if (authError || !authData.user) {
+        throw new Error("Impossible de vérifier le compte administrateur.");
+      }
+
+      const clientShops = (data.shops as AdminShopRow[]).filter(
+        (shop) => shop.owner_id !== authData.user.id,
+      );
+
+      setShops(clientShops);
+    } catch (loadError) {
+      setShopsError(loadError instanceof Error ? loadError.message : "Impossible de charger les boutiques.");
+    } finally {
+      setShopsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadShops();
+  }, []);
+
+  async function handleCreateShop(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setFeedback("");
+    setCreatedShop(null);
+    setSaving(true);
+    try {
+      const { data, error: functionError } = await supabase.functions.invoke(
+        "create-shop-for-owner",
+        { body: {
+          name: name.trim(),
+          email: email.trim().toLowerCase(),
+          address: address.trim(),
+          currency_code: currencyCode.trim().toUpperCase(),
+          timezone: timezone.trim(),
+        } },
+      );
+      if (functionError) {
+        let message = functionError.message || "La création de la boutique a échoué.";
+        try {
+          const response = (functionError as { context?: Response }).context;
+          if (response) {
+            const details = await response.clone().json() as { error?: string; message?: string };
+            message = details.error || details.message || message;
+          }
+        } catch { /* message Supabase conservé */ }
+        throw new Error(message);
+      }
+      if (!data?.success || !data?.shop) {
+        throw new Error(data?.error || "Supabase n'a pas confirmé la création de la boutique.");
+      }
+      setCreatedShop(data.shop as AdminCreatedShop);
+      setFeedback(data.message || "Boutique créée. Vérifie la réception de l'invitation par e-mail.");
+      setName("");
+      setEmail("");
+      setAddress("");
+      setCurrencyCode("CDF");
+      setTimezone("Africa/Lubumbashi");
+      await loadShops();
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : "Une erreur est survenue.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const filteredShops = shops.filter((shop) => {
+    const term = shopSearch.trim().toLocaleLowerCase("fr");
+    if (!term) return true;
+    return [shop.name, shop.owner_email ?? "", shop.address ?? "", shop.currency_code]
+      .some((value) => value.toLocaleLowerCase("fr").includes(term));
+  });
+
+  return (
+    <div className="module-page super-admin-page">
+      {view === "create" && <section className="product-form-card admin-shop-card" aria-labelledby="admin-create-shop-title">
+        <div className="product-form-heading">
+          <div>
+            <h2 id="admin-create-shop-title"><Icon name="store" size={20} /> Ajouter une boutique</h2>
+            <p>Le propriétaire recevra une invitation par e-mail pour accéder à son compte.</p>
+          </div>
+        </div>
+        {feedback && <div className="catalog-notice" role="status">{feedback}</div>}
+        {error && <p className="catalog-error" role="alert">{error}</p>}
+        <form onSubmit={handleCreateShop} className="product-form admin-shop-form">
+          <div className="field-group admin-field-group">
+            <label htmlFor="admin-shop-name">Nom de la boutique *</label>
+            <input id="admin-shop-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={120} required disabled={saving} placeholder="Ex. Boutique Élégance" />
+          </div>
+          <div className="field-group admin-field-group">
+            <label htmlFor="admin-owner-email">E-mail du propriétaire *</label>
+            <input id="admin-owner-email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} maxLength={254} required disabled={saving} placeholder="proprietaire@exemple.com" />
+          </div>
+          <div className="field-group admin-field-group">
+            <label htmlFor="admin-shop-address">Adresse</label>
+            <input id="admin-shop-address" value={address} onChange={(event) => setAddress(event.target.value)} maxLength={500} disabled={saving} placeholder="Ville, pays" />
+          </div>
+          <div className="field-group admin-field-group">
+            <label htmlFor="admin-shop-currency">Devise</label>
+            <select id="admin-shop-currency" value={currencyCode} onChange={(event) => setCurrencyCode(event.target.value)} disabled={saving}>
+              <option value="CDF">CDF — Franc congolais</option>
+              <option value="RWF">RWF — Franc rwandais</option>
+              <option value="USD">USD — Dollar américain</option>
+              <option value="EUR">EUR — Euro</option>
+            </select>
+          </div>
+          <div className="field-group admin-field-group">
+            <label htmlFor="admin-shop-timezone">Fuseau horaire</label>
+            <select id="admin-shop-timezone" value={timezone} onChange={(event) => setTimezone(event.target.value)} disabled={saving}>
+              <option value="Africa/Lubumbashi">Africa/Lubumbashi</option>
+              <option value="Africa/Kigali">Africa/Kigali</option>
+              <option value="Africa/Kinshasa">Africa/Kinshasa</option>
+              <option value="Africa/Nairobi">Africa/Nairobi</option>
+              <option value="UTC">UTC</option>
+            </select>
+          </div>
+          <div className="product-form-actions admin-form-actions">
+            <button className="primary-button" type="submit" disabled={saving}>
+              {saving ? "Création en cours…" : "Créer la boutique et inviter"}
+            </button>
+          </div>
+        </form>
+        {createdShop && (
+          <div className="catalog-notice" role="status">
+            <strong>Boutique créée avec succès</strong>
+            <p>Nom : {createdShop.name}</p>
+            <p>Identifiant : <code>{createdShop.id}</code></p>
+            <p>Devise : {createdShop.currency_code}</p>
+            <p>Propriétaire invité. Vérifie que l’e-mail est bien arrivé avant de relancer une invitation.</p>
+          </div>
+        )}
+      </section>}
+
+      {view === "shops" && <section className="product-form-card admin-shops-list-card" aria-labelledby="admin-shops-list-title">
+        <div className="admin-shops-list-heading">
+          <div>
+            <h2 id="admin-shops-list-title"><Icon name="store" size={20} /> Boutiques enregistrées</h2>
+            <p>Liste des boutiques connues de StockWise et de leurs propriétaires.</p>
+          </div>
+          <button className="secondary-button" type="button" onClick={() => void loadShops()} disabled={shopsLoading}>
+            <span aria-hidden="true">↻</span> {shopsLoading ? "Actualisation…" : "Actualiser"}
+          </button>
+        </div>
+        <div className="admin-shops-toolbar">
+          <label className="admin-shops-search">
+            <span aria-hidden="true">⌕</span>
+            <input value={shopSearch} onChange={(event) => setShopSearch(event.target.value)} placeholder="Rechercher une boutique, un propriétaire…" aria-label="Rechercher parmi les boutiques" />
+          </label>
+          <span className="admin-shops-count">{filteredShops.length} boutique{filteredShops.length > 1 ? "s" : ""}</span>
+        </div>
+        {shopsError && <div className="catalog-error" role="alert">{shopsError}<p>Vérifie que la fonction Edge Function a été mise à jour pour accepter l’action <code>list-shops</code>.</p></div>}
+        {shopsLoading ? (
+          <div className="admin-shops-empty" role="status"><span className="loading-spinner" aria-hidden="true" /> Chargement des boutiques…</div>
+        ) : shopsError ? null : filteredShops.length === 0 ? (
+          <div className="admin-shops-empty">
+            <Icon name="store" size={28} />
+            <strong>{shopSearch ? "Aucun résultat" : "Aucune boutique enregistrée"}</strong>
+            <span>{shopSearch ? "Essaie un autre terme de recherche." : "Les boutiques créées apparaîtront ici."}</span>
+          </div>
+        ) : (
+          <div className="admin-shops-table-wrap">
+            <table className="admin-shops-table">
+              <thead>
+                <tr><th>Boutique</th><th>Propriétaire</th><th>Adresse</th><th>Devise</th><th>Créée le</th><th>Action</th></tr>
+              </thead>
+              <tbody>
+                {filteredShops.map((shop) => (
+                  <tr key={shop.id}>
+                    <td><strong>{shop.name}</strong><small>{shop.id}</small></td>
+                    <td>{shop.owner_email || <span className="admin-muted">E-mail indisponible</span>}</td>
+                    <td>{shop.address || <span className="admin-muted">Non renseignée</span>}</td>
+                    <td><span className="admin-currency-pill">{shop.currency_code}</span></td>
+                    <td>{shop.created_at ? new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium" }).format(new Date(shop.created_at)) : "—"}</td>
+                    <td><button className="secondary-button" type="button" onClick={() => setSelectedShop(shop)} aria-label={`Voir les détails de ${shop.name}`}>Voir les détails</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>}
+
+      {view === "shops" && selectedShop && (
+        <section className="product-form-card admin-shop-details-card" aria-labelledby="admin-shop-details-title" style={{ marginTop: 20 }}>
+          <div className="admin-shops-list-heading">
+            <div>
+              <h2 id="admin-shop-details-title"><Icon name="store" size={20} /> Détails de la boutique</h2>
+              <p>Informations de la boutique et coordonnées du propriétaire.</p>
+            </div>
+            <button className="secondary-button" type="button" onClick={() => setSelectedShop(null)}>Fermer</button>
+          </div>
+          <div className="admin-shop-details-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 16, marginTop: 20 }}>
+            <div className="admin-shop-detail-item" style={{ padding: 16, border: "1px solid #e1e9e3", borderRadius: 12 }}>
+              <span className="admin-muted">Nom de la boutique</span>
+              <strong style={{ display: "block", marginTop: 6 }}>{selectedShop.name}</strong>
+            </div>
+            <div className="admin-shop-detail-item" style={{ padding: 16, border: "1px solid #e1e9e3", borderRadius: 12 }}>
+              <span className="admin-muted">E-mail du propriétaire</span>
+              <strong style={{ display: "block", marginTop: 6, overflowWrap: "anywhere" }}>{selectedShop.owner_email || "E-mail indisponible"}</strong>
+            </div>
+            <div className="admin-shop-detail-item" style={{ padding: 16, border: "1px solid #e1e9e3", borderRadius: 12 }}>
+              <span className="admin-muted">Adresse</span>
+              <strong style={{ display: "block", marginTop: 6 }}>{selectedShop.address || "Non renseignée"}</strong>
+            </div>
+            <div className="admin-shop-detail-item" style={{ padding: 16, border: "1px solid #e1e9e3", borderRadius: 12 }}>
+              <span className="admin-muted">Devise</span>
+              <strong style={{ display: "block", marginTop: 6 }}>{selectedShop.currency_code}</strong>
+            </div>
+            <div className="admin-shop-detail-item" style={{ padding: 16, border: "1px solid #e1e9e3", borderRadius: 12 }}>
+              <span className="admin-muted">Fuseau horaire</span>
+              <strong style={{ display: "block", marginTop: 6 }}>{selectedShop.timezone || "Non renseigné"}</strong>
+            </div>
+            <div className="admin-shop-detail-item" style={{ padding: 16, border: "1px solid #e1e9e3", borderRadius: 12 }}>
+              <span className="admin-muted">Date de création</span>
+              <strong style={{ display: "block", marginTop: 6 }}>{selectedShop.created_at ? new Intl.DateTimeFormat("fr-FR", { dateStyle: "long", timeStyle: "short" }).format(new Date(selectedShop.created_at)) : "Indisponible"}</strong>
+            </div>
+            <div className="admin-shop-detail-item" style={{ padding: 16, border: "1px solid #e1e9e3", borderRadius: 12, gridColumn: "1 / -1" }}>
+              <span className="admin-muted">Identifiant de la boutique</span>
+              <code style={{ display: "block", marginTop: 6, overflowWrap: "anywhere" }}>{selectedShop.id}</code>
+            </div>
+          </div>
+          <p className="admin-muted" style={{ marginTop: 16 }}>La gestion des accès du propriétaire n’est pas activée ici ; aucune autorisation n’a été modifiée.</p>
+        </section>
+      )}
+
+      <p className="security-note admin-security-note">
+        <span className="security-icon" aria-hidden="true">✓</span>
+        <span>Les droits Super Admin sont vérifiés côté serveur par la fonction Supabase. Aucune clé secrète n’est utilisée dans le navigateur.</span>
+      </p>
+    </div>
+  );
+}
+
+
+function SuperAdminDashboard({ onManageShops }: { onManageShops: () => void }) {
+  const [shops, setShops] = useState<AdminShopRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  async function loadOverview() {
+    setLoading(true);
+    setError("");
+    try {
+      const { data, error: functionError } = await supabase.functions.invoke(
+        "create-shop-for-owner",
+        { body: { action: "list-shops" } },
+      );
+      if (functionError) {
+        let message = functionError.message || "Impossible de charger les données de la plateforme.";
+        try {
+          const response = (functionError as { context?: Response }).context;
+          if (response) {
+            const details = await response.clone().json() as { error?: string; message?: string };
+            message = details.error || details.message || message;
+          }
+        } catch { /* garder le message initial */ }
+        throw new Error(message);
+      }
+      if (!data?.success || !Array.isArray(data.shops)) {
+        throw new Error(data?.error || "Réponse invalide lors du chargement des boutiques.");
+      }
+      const { data: authData, error: authError } =
+        await supabase.auth.getUser();
+
+      if (authError || !authData.user) {
+        throw new Error("Impossible de vérifier le compte administrateur.");
+      }
+
+      const clientShops = (data.shops as AdminShopRow[]).filter(
+        (shop) => shop.owner_id !== authData.user.id,
+      );
+
+      setShops(clientShops);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Impossible de charger le tableau de bord.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void loadOverview(); }, []);
+
+  const currencies = new Set(shops.map((item) => item.currency_code));
+  const recentShops = [...shops].sort((a, b) =>
+    new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime()
+  ).slice(0, 5);
+
+  return (
+    <div className="module-page super-admin-page super-admin-dashboard">
+      <section className="dashboard-welcome super-admin-welcome">
+        <div>
+          <div className="welcome-overline"><span className="live-dot" /> VUE GLOBALE DE LA PLATEFORME</div>
+          <h1>Tableau de bord</h1>
+          <p>Supervise les boutiques StockWise et accède rapidement aux outils d’administration.</p>
+        </div>
+        <button className="secondary-button admin-refresh-button" type="button" onClick={() => void loadOverview()} disabled={loading}>
+          <Icon name="refresh-cw" size={16} /> {loading ? "Actualisation…" : "Actualiser"}
+        </button>
+      </section>
+
+      {error && <div className="catalog-error" role="alert">{error}</div>}
+
+      <section className="admin-overview-metrics" aria-label="Indicateurs de la plateforme">
+        <article className="admin-overview-card">
+          <span className="admin-overview-icon admin-overview-icon-green"><Icon name="store" size={21} /></span>
+          <div><span className="admin-overview-label">Boutiques enregistrées</span><strong>{loading ? "…" : shops.length}</strong><small>Comptes boutiques connus</small></div>
+        </article>
+        <article className="admin-overview-card">
+          <span className="admin-overview-icon admin-overview-icon-blue"><Icon name="users" size={21} /></span>
+          <div><span className="admin-overview-label">Propriétaires identifiés</span><strong>{loading ? "…" : new Set(shops.map((item) => item.owner_id)).size}</strong><small>Propriétaires associés à une boutique</small></div>
+        </article>
+        <article className="admin-overview-card">
+          <span className="admin-overview-icon admin-overview-icon-purple"><Icon name="wallet" size={21} /></span>
+          <div><span className="admin-overview-label">Devises utilisées</span><strong>{loading ? "…" : currencies.size}</strong><small>Devises configurées dans la plateforme</small></div>
+        </article>
+      </section>
+
+      <section className="admin-overview-actions">
+        <div>
+          <span className="section-eyebrow">GESTION DE LA PLATEFORME</span>
+          <h2>Administration des boutiques</h2>
+          <p>Crée de nouveaux espaces StockWise, invite leurs propriétaires et consulte les boutiques déjà enregistrées.</p>
+        </div>
+        <button className="primary-button" type="button" onClick={onManageShops}>
+          <Icon name="store" size={17} /> Gérer les boutiques <Icon name="arrow-right" size={16} />
+        </button>
+      </section>
+
+      <section className="product-form-card admin-recent-shops-card" aria-labelledby="admin-recent-shops-title">
+        <div className="admin-shops-list-heading">
+          <div><h2 id="admin-recent-shops-title"><Icon name="clock" size={19} /> Boutiques récentes</h2><p>Les cinq dernières boutiques créées sur StockWise.</p></div>
+          <button className="secondary-button" type="button" onClick={onManageShops}>Voir toutes les boutiques</button>
+        </div>
+        {loading ? <p className="admin-empty-state">Chargement des boutiques…</p> : recentShops.length === 0 ? <p className="admin-empty-state">Aucune boutique enregistrée pour le moment.</p> : (
+          <div className="admin-recent-shops-list">
+            {recentShops.map((item) => (
+              <div className="admin-recent-shop-row" key={item.id}>
+                <span className="admin-recent-shop-icon"><Icon name="store" size={18} /></span>
+                <div className="admin-recent-shop-main"><strong>{item.name}</strong><span>{item.owner_email || "E-mail du propriétaire indisponible"}</span></div>
+                <span className="admin-currency-pill">{item.currency_code}</span>
+                <span className="admin-recent-shop-date">{item.created_at ? new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "short", year: "numeric" }).format(new Date(item.created_at)) : "—"}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <p className="security-note admin-security-note"><span className="security-icon" aria-hidden="true">✓</span><span>Les données de la plateforme sont chargées par la fonction Supabase qui vérifie les droits Super Admin côté serveur.</span></p>
+    </div>
+  );
+}
+
 function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [user, setUser] = useState<User | null>(null);
+  const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
   const [shop, setShop] = useState<Shop | null>(null);
   const [loading, setLoading] = useState(true);
   const [shopLoading, setShopLoading] = useState(false);
@@ -171,7 +581,7 @@ function App() {
   const [error, setError] = useState("");
   const [shopError, setShopError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [activeModule, setActiveModule] = useState<"dashboard" | "products" | "stock" | "scanner" | "sales" | "receipts">(
+  const [activeModule, setActiveModule] = useState<"dashboard" | "products" | "stock" | "scanner" | "sales" | "receipts" | "admin-dashboard" | "admin" | "admin-create">(
     "dashboard",
   );
   const [dashboardMetrics, setDashboardMetrics] = useState({ productCount: 0, salesToday: 0, lowStockCount: 0, stockValue: 0, stockMovementCount: 0, salesCount: 0 });
@@ -219,8 +629,56 @@ function App() {
   useEffect(() => {
     let cancelled = false;
 
-    async function loadShop() {
+    async function checkPlatformAdmin() {
       if (!user) {
+        setIsPlatformAdmin(false);
+        setActiveModule("dashboard");
+        return;
+      }
+
+      try {
+        const { data, error: adminError } = await supabase
+          .from("platform_admins")
+          .select("user_id")
+          .eq("user_id", user.id)
+          .maybeSingle();
+
+        if (cancelled) return;
+
+        const allowed = !adminError && Boolean(data?.user_id);
+        setIsPlatformAdmin(allowed);
+
+        // Un Super Admin arrive toujours dans son espace d'administration.
+        // Un propriétaire ne peut pas conserver une route d'administration.
+        setActiveModule((current) => {
+          if (allowed) {
+            return current === "admin" || current === "admin-create" ? current : "admin-dashboard";
+          }
+          return current === "admin" || current === "admin-create" || current === "admin-dashboard"
+            ? "dashboard"
+            : current;
+        });
+      } catch {
+        if (!cancelled) {
+          setIsPlatformAdmin(false);
+          setActiveModule((current) =>
+            current === "admin" || current === "admin-create" || current === "admin-dashboard"
+              ? "dashboard"
+              : current
+          );
+        }
+      }
+    }
+
+    void checkPlatformAdmin();
+    return () => { cancelled = true; };
+  }, [user]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadShop() {
+      if (!user || isPlatformAdmin) {
         setShop(null);
         setShopError("");
         setShopLoading(false);
@@ -271,7 +729,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [user, isPlatformAdmin]);
 
   useEffect(() => {
     let cancelled = false;
@@ -429,29 +887,50 @@ function App() {
   }
 
   if (user) {
-    const navItems = [
-      {
-        label: "Vue d'ensemble",
-        icon: "dashboard" as const,
-        active: activeModule === "dashboard",
-        module: "dashboard" as const,
-      },
-      {
-        label: "Produits",
-        icon: "products" as const,
-        active: activeModule === "products",
-        module: "products" as const,
-      },
-      {
-        label: "Gestion du stock",
-        icon: "stock" as const,
-        active: activeModule === "stock",
-        module: "stock" as const,
-      },
-      { label: "Scanner", icon: "scanner" as const, active: activeModule === "scanner", module: "scanner" as const },
-      { label: "Ventes", icon: "sales" as const, active: activeModule === "sales", module: "sales" as const },
-      { label: "Reçus", icon: "receipts" as const, active: activeModule === "receipts", module: "receipts" as const },
-    ];
+    const navItems = isPlatformAdmin
+      ? [
+          {
+            label: "Tableau de bord",
+            icon: "dashboard" as const,
+            active: activeModule === "admin-dashboard",
+            module: "admin-dashboard" as const,
+          },
+          {
+            label: "Boutiques",
+            icon: "store" as const,
+            active: activeModule === "admin",
+            module: "admin" as const,
+          },
+          {
+            label: "Ajouter une boutique",
+            icon: "plus-circle" as const,
+            active: activeModule === "admin-create",
+            module: "admin-create" as const,
+          },
+        ]
+      : [
+          {
+            label: "Vue d'ensemble",
+            icon: "dashboard" as const,
+            active: activeModule === "dashboard",
+            module: "dashboard" as const,
+          },
+          {
+            label: "Produits",
+            icon: "products" as const,
+            active: activeModule === "products",
+            module: "products" as const,
+          },
+          {
+            label: "Gestion du stock",
+            icon: "stock" as const,
+            active: activeModule === "stock",
+            module: "stock" as const,
+          },
+          { label: "Scanner", icon: "scanner" as const, active: activeModule === "scanner", module: "scanner" as const },
+          { label: "Ventes", icon: "sales" as const, active: activeModule === "sales", module: "sales" as const },
+          { label: "Reçus", icon: "receipts" as const, active: activeModule === "receipts", module: "receipts" as const },
+        ];
 
     return (
       <main className="workspace">
@@ -501,18 +980,18 @@ function App() {
               <span>Espace de travail</span>
               <Icon name="chevron-right" size={15} />
               <strong>
-                {activeModule === "products" ? "Produits" : activeModule === "stock" ? "Gestion du stock" : activeModule === "scanner" ? "Scanner" : activeModule === "sales" ? "Ventes" : activeModule === "receipts" ? "Reçus" : "Vue d'ensemble"}
+                {activeModule === "admin-dashboard" ? "Super Admin" : activeModule === "admin" ? "Boutiques" : activeModule === "admin-create" ? "Ajouter une boutique" : activeModule === "products" ? "Produits" : activeModule === "stock" ? "Gestion du stock" : activeModule === "scanner" ? "Scanner" : activeModule === "sales" ? "Ventes" : activeModule === "receipts" ? "Reçus" : "Vue d'ensemble"}
               </strong>
             </div>
 
             <div className="topbar-actions">
               <div className="topbar-shop">
                 <span className="topbar-shop-mark">
-                  <Icon name="store" size={17} />
+                  <Icon name={activeModule === "admin-dashboard" || activeModule === "admin" || activeModule === "admin-create" ? "shield" : "store"} size={17} />
                 </span>
                 <div>
-                  <strong>{shop?.name ?? "Ma boutique"}</strong>
-                  <span>{shop?.currency_code ?? "CDF"} · Goma, RDC</span>
+                  <strong>{activeModule === "admin-dashboard" || activeModule === "admin" || activeModule === "admin-create" ? "StockWise Admin" : shop?.name ?? "Ma boutique"}</strong>
+                  <span>{activeModule === "admin-dashboard" || activeModule === "admin" || activeModule === "admin-create" ? "Administration plateforme" : `${shop?.currency_code ?? "CDF"} · Goma, RDC`}</span>
                 </div>
               </div>
               <div
@@ -534,7 +1013,15 @@ function App() {
           </header>
 
           <div className="workspace-content">
-            {activeModule === "products" ? (
+            {isPlatformAdmin && activeModule !== "admin-dashboard" && activeModule !== "admin" && activeModule !== "admin-create" ? (
+              <SuperAdminDashboard onManageShops={() => setActiveModule("admin")} />
+            ) : activeModule === "admin-dashboard" && isPlatformAdmin ? (
+              <SuperAdminDashboard onManageShops={() => setActiveModule("admin")} />
+            ) : activeModule === "admin" && isPlatformAdmin ? (
+              <SuperAdminModule view="shops" />
+            ) : activeModule === "admin-create" && isPlatformAdmin ? (
+              <SuperAdminModule view="create" />
+            ) : activeModule === "products" ? (
               <ProductsModule shop={shop} />
             ) : activeModule === "stock" ? (
               <StockModule shop={shop} user={user} />
@@ -3089,6 +3576,7 @@ type IconName =
   | "sales"
   | "receipts"
   | "store"
+  | "plus-circle"
   | "logout"
   | "chevron-right"
   | "calendar"
@@ -3097,7 +3585,10 @@ type IconName =
   | "shield"
   | "alert"
   | "scan"
-  | "smartphone";
+  | "smartphone"
+  | "refresh-cw"
+  | "users"
+  | "arrow-right";
 
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const common = {
@@ -3156,6 +3647,12 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
         <path d="M5 10v10h14V10M9 20v-6h6v6" />
       </>
     ),
+    "plus-circle": (
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 8v8M8 12h8" />
+      </>
+    ),
     logout: (
       <>
         <path d="M10 17l5-5-5-5M15 12H3" />
@@ -3205,6 +3702,21 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
         <path d="M11 18h2" />
       </>
     ),
+    "refresh-cw": (
+      <>
+        <path d="M20 7v5h-5" />
+        <path d="M4 17v-5h5" />
+        <path d="M5.6 9A7 7 0 0 1 18 6l2 6M4 12l2 6a7 7 0 0 0 12.4-3" />
+      </>
+    ),
+    users: (
+      <>
+        <path d="M16 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+        <circle cx="10" cy="7" r="4" />
+        <path d="M20 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
+      </>
+    ),
+    "arrow-right": <path d="M5 12h14m-7-7 7 7-7 7" />,
   };
 
   return <svg {...common}>{paths[name]}</svg>;
