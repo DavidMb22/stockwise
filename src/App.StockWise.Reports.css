@@ -1,0 +1,198 @@
+/* StockWise Reports module — scoped styles */
+.reports-page {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+}
+.reports-page .reports-welcome {
+  align-items: center;
+  gap: 24px;
+  margin-bottom: 0;
+}
+.reports-page .reports-welcome > div:first-child {
+  min-width: 220px;
+}
+.reports-page .reports-welcome h1 {
+  margin-bottom: 8px;
+}
+.reports-page .reports-welcome p {
+  max-width: 620px;
+  line-height: 1.6;
+}
+.reports-page .reports-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 0;
+}
+.reports-page .reports-period-select {
+  min-height: 46px;
+  min-width: 165px;
+  padding: 0 38px 0 14px;
+  border: 1px solid #d9e5dd;
+  border-radius: 10px;
+  background-color: #fff;
+  color: #183326;
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+  cursor: pointer;
+}
+.reports-page .reports-period-select:focus-visible {
+  border-color: #16804f;
+  box-shadow: 0 0 0 3px rgba(22, 128, 79, .12);
+}
+.reports-page .reports-toolbar .primary-button,
+.reports-page .reports-toolbar .secondary-button {
+  min-height: 46px;
+  justify-content: center;
+  white-space: nowrap;
+}
+.reports-page .reports-metrics {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin: 0;
+}
+.reports-page .reports-metrics .metric-card {
+  min-width: 0;
+  height: 100%;
+  padding: 22px;
+  border-radius: 16px;
+}
+.reports-page .reports-metrics .metric-value {
+  overflow-wrap: anywhere;
+  font-size: clamp(22px, 2vw, 30px);
+  line-height: 1.2;
+}
+.reports-page .reports-metrics .metric-footnote {
+  line-height: 1.5;
+}
+.reports-page .reports-chart-card {
+  margin-top: 0;
+  padding: 24px;
+  border-radius: 18px;
+  min-width: 0;
+}
+.reports-page .reports-chart-card .product-form-heading {
+  margin-bottom: 8px;
+}
+.reports-page .reports-chart-card .product-form-heading h2 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.reports-page .reports-chart-card .product-form-heading p {
+  margin-top: 8px;
+  line-height: 1.5;
+}
+.reports-page .reports-chart-card > div[style*="display: grid"] {
+  width: 100%;
+}
+.reports-page .reports-stock-metrics {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin: 0;
+}
+.reports-page .reports-stock-metrics .metric-card {
+  grid-column: 1 / 2;
+  padding: 22px;
+  border-radius: 16px;
+}
+.reports-page .security-note {
+  margin: 0;
+  padding: 18px 20px;
+  border-radius: 14px;
+  line-height: 1.55;
+}
+@media (max-width: 1180px) {
+  .reports-page .reports-welcome {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .reports-page .reports-toolbar {
+    justify-content: flex-start;
+    width: 100%;
+  }
+  .reports-page .reports-metrics,
+  .reports-page .reports-stock-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .reports-page .reports-stock-metrics .metric-card {
+    grid-column: auto;
+  }
+}
+@media (max-width: 640px) {
+  .reports-page {
+    gap: 16px;
+  }
+  .reports-page .reports-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .reports-page .reports-period-select,
+  .reports-page .reports-toolbar .primary-button,
+  .reports-page .reports-toolbar .secondary-button {
+    width: 100%;
+  }
+  .reports-page .reports-metrics,
+  .reports-page .reports-stock-metrics {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+  .reports-page .reports-metrics .metric-card,
+  .reports-page .reports-stock-metrics .metric-card {
+    padding: 18px;
+  }
+  .reports-page .reports-chart-card {
+    padding: 18px 14px;
+  }
+  .reports-page .reports-chart-card > div[style*="grid-template-columns"] {
+    grid-template-columns: 58px minmax(30px, 1fr) minmax(78px, auto) !important;
+    gap: 8px !important;
+  }
+  .reports-page .security-note {
+    align-items: flex-start;
+    padding: 14px;
+    font-size: 13px;
+  }
+}
+
+/* Selecteur de periode des rapports */
+.reports-page select {
+  min-height: 48px;
+  padding: 0 38px 0 14px;
+  border: 1px solid #d7e5dc;
+  border-radius: 10px;
+  background-color: #fff;
+  color: #173b2b;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.reports-page select:hover {
+  border-color: #137c4b;
+}
+
+.reports-page select:focus-visible {
+  border-color: #137c4b;
+  box-shadow: 0 0 0 3px rgba(19, 124, 75, 0.12);
+}
+
+.reports-page select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+@media (max-width: 600px) {
+  .reports-page select {
+    width: 100%;
+    min-height: 46px;
+  }
+}

@@ -569,6 +569,105 @@ function SuperAdminDashboard({ onManageShops }: { onManageShops: () => void }) {
   );
 }
 
+
+type ReportSale = { id: string; total_amount: number | string | null; created_at: string };
+
+function ReportsModule({ shop }: { shop: Shop | null }) {
+  const [period, setPeriod] = useState<"7d" | "30d" | "month" | "year">("30d");
+  const [sales, setSales] = useState<ReportSale[]>([]);
+  const [variantCount, setVariantCount] = useState(0);
+  const [stockUnits, setStockUnits] = useState(0);
+  const [stockValue, setStockValue] = useState(0);
+  const [lowStock, setLowStock] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const currency = shop?.currency_code || "CDF";
+
+  async function loadReports() {
+    if (!shop?.id) { setSales([]); setLoading(false); return; }
+    setLoading(true); setError("");
+    try {
+      const now = new Date();
+      const start = new Date(now);
+      if (period === "7d") start.setDate(now.getDate() - 6);
+      else if (period === "30d") start.setDate(now.getDate() - 29);
+      else if (period === "month") start.setDate(1);
+      else { start.setMonth(0, 1); start.setHours(0, 0, 0, 0); }
+      const [salesResult, variantsResult] = await Promise.all([
+        supabase.from("sales").select("id, total_amount, created_at").eq("shop_id", shop.id)
+          .gte("created_at", start.toISOString()).lte("created_at", now.toISOString()).order("created_at", { ascending: true }),
+        supabase.from("product_variants").select("stock_quantity, low_stock_threshold, purchase_price, is_active")
+          .eq("shop_id", shop.id).eq("is_active", true),
+      ]);
+      if (salesResult.error) throw new Error(`Ventes : ${salesResult.error.message}`);
+      if (variantsResult.error) throw new Error(`Stock : ${variantsResult.error.message}`);
+      const variants = variantsResult.data ?? [];
+      setSales((salesResult.data ?? []) as ReportSale[]);
+      setVariantCount(variants.length);
+      setStockUnits(variants.reduce((sum, v) => sum + Number(v.stock_quantity ?? 0), 0));
+      setStockValue(variants.reduce((sum, v) => sum + Number(v.stock_quantity ?? 0) * Number(v.purchase_price ?? 0), 0));
+      setLowStock(variants.filter(v => Number(v.stock_quantity ?? 0) <= Number(v.low_stock_threshold ?? 0)).length);
+    } catch (e) { setError(e instanceof Error ? e.message : "Impossible de charger les rapports."); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { void loadReports(); }, [shop?.id, period]);
+  const revenue = sales.reduce((sum, sale) => sum + Number(sale.total_amount ?? 0), 0);
+  const average = sales.length ? revenue / sales.length : 0;
+  const daily = new Map<string, { label: string; amount: number }>();
+  for (const sale of sales) {
+    const date = new Date(sale.created_at);
+    const key = new Intl.DateTimeFormat("en-CA", { timeZone: shop?.timezone || "Africa/Lubumbashi", year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+    const label = new Intl.DateTimeFormat("fr-FR", { timeZone: shop?.timezone || "Africa/Lubumbashi", day: "numeric", month: "short" }).format(date);
+    const row = daily.get(key) ?? { label, amount: 0 }; row.amount += Number(sale.total_amount ?? 0); daily.set(key, row);
+  }
+  const dailyRows = [...daily.entries()].slice(-14);
+  const maxDaily = Math.max(1, ...dailyRows.map(([, row]) => row.amount));
+  function exportCsv() {
+    const rows = [["Date", "Identifiant vente", "Montant"], ...sales.map(sale => [
+      new Date(sale.created_at).toLocaleString("fr-FR", { timeZone: shop?.timezone || "Africa/Lubumbashi" }),
+      sale.id, String(Number(sale.total_amount ?? 0)),
+    ])];
+    const csv = rows.map(row => row.map(value => `"${String(value).replace(/"/g, '""')}"`).join(";")).join("\r\n");
+    const url = URL.createObjectURL(new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8;" }));
+    const link = document.createElement("a"); link.href = url; link.download = `stockwise-rapport-ventes-${period}.csv`;
+    document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+  }
+  return <div className="module-page reports-page">
+    <section className="dashboard-welcome">
+      <div><div className="welcome-overline"><span className="live-dot" /> ANALYSE DE VOTRE BOUTIQUE</div><h1>Rapports</h1><p>Suivez vos ventes et l’état de votre stock à partir des données enregistrées.</p></div>
+      <div className="product-form-actions" style={{ gap: 10, flexWrap: "wrap" }}>
+        <select aria-label="Période du rapport" value={period} onChange={e => setPeriod(e.target.value as typeof period)}>
+          <option value="7d">7 derniers jours</option><option value="30d">30 derniers jours</option><option value="month">Ce mois</option><option value="year">Cette année</option>
+        </select>
+        <button className="secondary-button" type="button" onClick={() => void loadReports()} disabled={loading}><Icon name="refresh-cw" size={16} /> {loading ? "Chargement…" : "Actualiser"}</button>
+        <button className="primary-button" type="button" onClick={exportCsv} disabled={loading || sales.length === 0}>Exporter les ventes CSV</button>
+      </div>
+    </section>
+    {error && <p className="catalog-error" role="alert">{error}</p>}
+    <section className="metrics-grid" aria-label="Indicateurs des rapports">
+      <article className="metric-card"><div className="metric-topline"><span className="metric-icon metric-icon-green"><Icon name="sales" size={20} /></span><span className="metric-placeholder">{loading ? "Chargement…" : "Période choisie"}</span></div><p>Chiffre d’affaires enregistré</p><div className="metric-value">{loading ? "…" : formatMoney(revenue, currency)}</div><span className="metric-footnote">Somme des ventes enregistrées, sans déduction de coûts</span></article>
+      <article className="metric-card"><div className="metric-topline"><span className="metric-icon metric-icon-blue"><Icon name="receipts" size={20} /></span><span className="metric-placeholder">{loading ? "…" : "Ventes"}</span></div><p>Nombre de ventes</p><div className="metric-value">{loading ? "…" : sales.length}</div><span className="metric-footnote">Ventes créées pendant la période</span></article>
+      <article className="metric-card"><div className="metric-topline"><span className="metric-icon metric-icon-purple"><Icon name="wallet" size={20} /></span><span className="metric-placeholder">Moyenne</span></div><p>Montant moyen par vente</p><div className="metric-value">{loading ? "…" : formatMoney(average, currency)}</div><span className="metric-footnote">Chiffre d’affaires ÷ nombre de ventes</span></article>
+      <article className="metric-card"><div className="metric-topline"><span className="metric-icon metric-icon-amber"><Icon name="stock" size={20} /></span><span className="metric-placeholder">Stock actuel</span></div><p>Valeur du stock au prix d’achat</p><div className="metric-value">{loading ? "…" : formatMoney(stockValue, currency)}</div><span className="metric-footnote">{stockUnits} unités · {variantCount} variantes actives</span></article>
+    </section>
+    <section className="product-form-card" style={{ marginTop: 20 }}>
+      <div className="product-form-heading"><div><h2><Icon name="reports" size={20} /> Évolution des ventes</h2><p>Chiffre d’affaires par jour, jusqu’aux 14 derniers jours disponibles.</p></div></div>
+      {loading ? <p>Chargement des données…</p> : dailyRows.length === 0 ? <div className="admin-shops-empty"><Icon name="sales" size={28} /><strong>Aucune vente pour cette période</strong><span>Les données apparaîtront ici après les premières ventes.</span></div> : <div style={{ display: "grid", gap: 12, marginTop: 20 }}>
+        {dailyRows.map(([key, row]) => <div key={key} style={{ display: "grid", gridTemplateColumns: "76px minmax(40px, 1fr) minmax(90px, auto)", alignItems: "center", gap: 12 }}>
+          <span style={{ color: "#65756c", fontSize: 13 }}>{row.label}</span>
+          <div style={{ height: 12, background: "#edf3ef", borderRadius: 999, overflow: "hidden" }}><div style={{ height: "100%", width: `${Math.max(2, row.amount / maxDaily * 100)}%`, background: "#137c4b", borderRadius: 999 }} /></div>
+          <strong style={{ textAlign: "right", fontSize: 13 }}>{formatMoney(row.amount, currency)}</strong>
+        </div>)}
+      </div>}
+    </section>
+    <section className="metrics-grid" style={{ marginTop: 20 }}>
+      <article className="metric-card"><div className="metric-topline"><span className="metric-icon metric-icon-amber"><Icon name="alert" size={20} /></span><span className="metric-placeholder">Stock actuel</span></div><p>Variantes au seuil de stock bas</p><div className="metric-value">{loading ? "…" : lowStock}</div><span className="metric-footnote">Variantes dont la quantité est au seuil ou en dessous</span></article>
+    </section>
+    <p className="security-note"><span className="security-icon" aria-hidden="true">✓</span><span>Les rapports sont filtrés par boutique et utilisent les données enregistrées dans StockWise.</span></p>
+  </div>;
+}
+
+
 function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -581,7 +680,7 @@ function App() {
   const [error, setError] = useState("");
   const [shopError, setShopError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [activeModule, setActiveModule] = useState<"dashboard" | "products" | "stock" | "scanner" | "sales" | "receipts" | "admin-dashboard" | "admin" | "admin-create">(
+  const [activeModule, setActiveModule] = useState<"dashboard" | "products" | "stock" | "scanner" | "sales" | "receipts" | "admin-dashboard" | "admin" | "admin-create" | "reports">(
     "dashboard",
   );
   const [dashboardMetrics, setDashboardMetrics] = useState({ productCount: 0, salesToday: 0, lowStockCount: 0, stockValue: 0, stockMovementCount: 0, salesCount: 0 });
@@ -930,6 +1029,7 @@ function App() {
           { label: "Scanner", icon: "scanner" as const, active: activeModule === "scanner", module: "scanner" as const },
           { label: "Ventes", icon: "sales" as const, active: activeModule === "sales", module: "sales" as const },
           { label: "Reçus", icon: "receipts" as const, active: activeModule === "receipts", module: "receipts" as const },
+          { label: "Rapports", icon: "reports" as const, active: activeModule === "reports", module: "reports" as const },
         ];
 
     return (
@@ -1031,6 +1131,8 @@ function App() {
               <SalesModule shop={shop} />
             ) : activeModule === "receipts" ? (
               <ReceiptsModule shop={shop} />
+            ) : activeModule === "reports" ? (
+              <ReportsModule shop={shop} />
             ) : (
               <>
                 <section className="dashboard-welcome">
@@ -3588,7 +3690,8 @@ type IconName =
   | "smartphone"
   | "refresh-cw"
   | "users"
-  | "arrow-right";
+  | "arrow-right"
+  | "reports";
 
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const common = {
@@ -3717,6 +3820,7 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
       </>
     ),
     "arrow-right": <path d="M5 12h14m-7-7 7 7-7 7" />,
+    reports: <><path d="M4 19V5M4 19h17" /><path d="m7 15 4-4 3 2 5-7" /><path d="M16 6h3v3" /></>,
   };
 
   return <svg {...common}>{paths[name]}</svg>;
