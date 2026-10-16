@@ -680,6 +680,15 @@ function App() {
   const [error, setError] = useState("");
   const [shopError, setShopError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [passwordSetupMode, setPasswordSetupMode] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    const type = params.get("type") || hashParams.get("type");
+    return type === "invite" || type === "recovery" || type === "signup";
+  });
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
+  const [showNewPassword, setShowNewPassword] = useState(false);
   const [activeModule, setActiveModule] = useState<"dashboard" | "products" | "stock" | "scanner" | "sales" | "receipts" | "admin-dashboard" | "admin" | "admin-create" | "reports">(
     "dashboard",
   );
@@ -916,6 +925,45 @@ function App() {
       setError(
         "Le serveur est inaccessible. Vérifie ta connexion Internet et réessaie.",
       );
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleSetPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+
+    if (newPassword.length < 8) {
+      setError("Le mot de passe doit contenir au moins 8 caractères.");
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      setError("Les deux mots de passe ne correspondent pas.");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!sessionData.session) {
+        throw new Error("Le lien d’invitation est invalide ou a expiré. Demande une nouvelle invitation.");
+      }
+
+      const { data, error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+      if (updateError) throw updateError;
+
+      setUser(data.user);
+      setPasswordSetupMode(false);
+      setNewPassword("");
+      setConfirmNewPassword("");
+      setError("");
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } catch (e) {
+      setError(e instanceof Error
+        ? e.message
+        : "Impossible d’enregistrer le mot de passe. Réessaie avec un nouveau lien d’invitation.");
     } finally {
       setSubmitting(false);
     }
@@ -1405,7 +1453,59 @@ function App() {
           </div>
 
           <div className="form-container">
-            <div className="login-heading">
+            {passwordSetupMode ? (
+              <>
+                <div className="login-heading">
+                  <p className="eyebrow">ACTIVATION DU COMPTE</p>
+                  <h1>Créer votre mot de passe</h1>
+                  <p>Choisissez un mot de passe pour sécuriser l’accès à votre boutique StockWise.</p>
+                </div>
+                <form onSubmit={handleSetPassword} className="login-form">
+                  <div className="field-group">
+                    <label htmlFor="new-password">Nouveau mot de passe</label>
+                    <input
+                      id="new-password"
+                      type={showNewPassword ? "text" : "password"}
+                      autoComplete="new-password"
+                      placeholder="8 caractères minimum"
+                      value={newPassword}
+                      onChange={(event) => setNewPassword(event.target.value)}
+                      minLength={8}
+                      required
+                      disabled={submitting}
+                    />
+                  </div>
+                  <div className="field-group">
+                    <label htmlFor="confirm-new-password">Confirmer le mot de passe</label>
+                    <input
+                      id="confirm-new-password"
+                      type={showNewPassword ? "text" : "password"}
+                      autoComplete="new-password"
+                      placeholder="Saisis à nouveau le mot de passe"
+                      value={confirmNewPassword}
+                      onChange={(event) => setConfirmNewPassword(event.target.value)}
+                      minLength={8}
+                      required
+                      disabled={submitting}
+                    />
+                  </div>
+                  <button className="text-button" type="button" onClick={() => setShowNewPassword((visible) => !visible)}>
+                    {showNewPassword ? "Masquer les mots de passe" : "Afficher les mots de passe"}
+                  </button>
+                  {error && <p className="form-error" role="alert">{error}</p>}
+                  <button className="primary-button" type="submit" disabled={submitting}>
+                    {submitting ? "Enregistrement…" : "Créer mon mot de passe"}
+                    {!submitting && <span aria-hidden="true">→</span>}
+                  </button>
+                </form>
+                <div className="security-note">
+                  <span className="security-icon" aria-hidden="true">✓</span>
+                  <p>Votre mot de passe est enregistré de manière sécurisée par Supabase.</p>
+                </div>
+              </>
+            ) : (
+              <>
+           <div className="login-heading">
               <p className="eyebrow">ESPACE VENDEUR</p>
               <h1>Bienvenue sur StockWise</h1>
               <p>
@@ -1475,8 +1575,9 @@ function App() {
               </span>
               <p>Connexion sécurisée par Supabase.</p>
             </div>
+              </>
+            )}
           </div>
-
           <footer className="panel-footer">
             <span>© {new Date().getFullYear()} StockWise</span>
             <span>Gestion de stock simplifiée</span>
