@@ -680,12 +680,18 @@ function App() {
   const [error, setError] = useState("");
   const [shopError, setShopError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [passwordSetupMode, setPasswordSetupMode] = useState(() => {
-    const params = new URLSearchParams(window.location.search);
-    const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-    const type = params.get("type") || hashParams.get("type");
-    return type === "invite" || type === "recovery" || type === "signup";
-  });
+ const [passwordSetupMode, setPasswordSetupMode] = useState(() => {
+  const params = new URLSearchParams(window.location.search);
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+
+  const type = params.get("type") || hashParams.get("type");
+  const isInviteRedirect = params.get("auth") === "invite";
+
+  return isInviteRedirect ||
+    type === "invite" ||
+    type === "recovery" ||
+    type === "signup";
+});
   const [newPassword, setNewPassword] = useState("");
   const [confirmNewPassword, setConfirmNewPassword] = useState("");
   const [showNewPassword, setShowNewPassword] = useState(false);
@@ -1029,6 +1035,38 @@ function App() {
           <span className="brand-mark">S</span>
           <p>Préparation de StockWise...</p>
         </div>
+      </main>
+    );
+  }
+
+  // Password setup must render before the authenticated dashboard.
+  // Keep the existing dashboard and its modules unchanged.
+  if (user && passwordSetupMode) {
+    return (
+      <main className="auth-page">
+        <section className="auth-shell">
+          <aside className="auth-visual">
+            <img className="auth-image" src={boutiqueImage} alt="Boutique de vêtements avec des articles prêts à être scannés" />
+            <div className="visual-overlay" />
+            <div className="visual-top"><Brand light /><span className="visual-tag">GESTION INTELLIGENTE</span></div>
+            <div className="visual-content"><p className="visual-eyebrow">VOTRE BOUTIQUE, MAÎTRISÉE</p><h2>Chaque article<br />à sa place.</h2><p>Gérez votre stock, suivez vos ventes et gardez le contrôle de votre boutique avec StockWise.</p></div>
+            <p className="visual-footer">Simple à utiliser. Pensé pour votre commerce.</p>
+          </aside>
+          <section className="auth-panel">
+            <div className="mobile-brand"><Brand /></div>
+            <div className="form-container">
+              <div className="login-heading"><p className="eyebrow">ACTIVATION DU COMPTE</p><h1>Créer votre mot de passe</h1><p>Choisissez un mot de passe pour sécuriser l’accès à votre boutique StockWise.</p></div>
+              <form onSubmit={handleSetPassword} className="login-form">
+                <div className="field-group"><label htmlFor="invite-new-password">Nouveau mot de passe</label><input id="invite-new-password" type={showNewPassword ? "text" : "password"} autoComplete="new-password" placeholder="8 caractères minimum" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} minLength={8} required disabled={submitting} /></div>
+                <div className="field-group"><label htmlFor="invite-confirm-password">Confirmer le mot de passe</label><input id="invite-confirm-password" type={showNewPassword ? "text" : "password"} autoComplete="new-password" placeholder="Saisis à nouveau le mot de passe" value={confirmNewPassword} onChange={(event) => setConfirmNewPassword(event.target.value)} minLength={8} required disabled={submitting} /></div>
+                <button className="text-button" type="button" onClick={() => setShowNewPassword((visible) => !visible)}>{showNewPassword ? "Masquer les mots de passe" : "Afficher les mots de passe"}</button>
+                {error && <p className="form-error" role="alert">{error}</p>}
+                <button className="primary-button" type="submit" disabled={submitting}>{submitting ? "Enregistrement…" : "Créer mon mot de passe"}{!submitting && <span aria-hidden="true">→</span>}</button>
+              </form>
+              <div className="security-note"><span className="security-icon" aria-hidden="true">✓</span><p>Votre mot de passe est enregistré de manière sécurisée par Supabase.</p></div>
+            </div>
+          </section>
+        </section>
       </main>
     );
   }
